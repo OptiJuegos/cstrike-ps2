@@ -120,6 +120,10 @@ void *_Mem_Alloc( byte *poolptr, size_t size, qboolean clear, const char *filena
 	if( mem == NULL )
 	{
 		Mem_PrintOutOfMemory( pool, size );
+#if XASH_PS2
+		// drop the game and return to the menu; during init or a nested error it still ends in Sys_Error
+		Host_Error( "Mem_Alloc: out of memory (alloc at %s:%i)\n", filename, fileline );
+#endif
 		Sys_Error( "Mem_Alloc: out of memory (alloc at %s:%i)\n", filename, fileline );
 	}
 	// Only account successful allocations: otherwise an OOM report wrongly

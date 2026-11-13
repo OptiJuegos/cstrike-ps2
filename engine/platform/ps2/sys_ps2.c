@@ -123,6 +123,7 @@ void ps2_crash_report(void)
  */
 static int ps2_screen_log;
 volatile u32 ps2_wd_progress; // bumped by every printf and host frame; the hang watchdog reads it
+static volatile int ps2_fatal_shown; // the error screen idles on purpose: the watchdog must not wipe it
 static int ps2_log_started;
 static unsigned ps2_log_lines;
 static char ps2_log_pending[8192];
@@ -155,11 +156,24 @@ static void ps2_log_append(const char *data, size_t n)
     write(fd, data, n);
 }
 
+/* Release build (build-engine.ps1 -Release): no boot.log, and only errors are
+ * printed. Every printed line is a SIF round trip to the IOP on a console. */
+#ifndef XASH_PS2_RELEASE
+#define XASH_PS2_RELEASE 0
+#endif
+
+static int ps2_log_keep(const char *text)
+{
+    return !XASH_PS2_RELEASE || strstr(text, "SYS_ERROR") || strstr(text, "HANG")
+        || strstr(text, "EXCEPTION") || strstr(text, "Error");
+}
+
 static void ps2_boot_log(const char *text)
 {
     size_t n;
     if (strncmp(text, "[XASH-PS2]", 10)) return;
     if (ps2_screen_log) scr_printf("%s", text + 11);
+    if (XASH_PS2_RELEASE) return;
     /* shortcut: line cap keeps per-frame traces from stalling on USB writes;
      * raise it when debugging a late in-game hang. */
     if (++ps2_log_lines > 3000) return;
@@ -186,6 +200,7 @@ int __wrap_printf(const char *format, ...)
     n = vsnprintf(text, sizeof(text), format, args);
     va_end(args);
     ps2_wd_progress++;
+    if (!ps2_log_keep(text)) return n;
     fputs(text, stdout);
     ps2_boot_log(text);
     return n;
@@ -195,6 +210,7 @@ int __wrap_puts(const char *text)
 {
     char line[1024];
     snprintf(line, sizeof(line), "%s\n", text);
+    if (!ps2_log_keep(line)) return 1;
     fputs(line, stdout);
     ps2_boot_log(line);
     return 1;
@@ -327,8 +343,10 @@ DIR *__wrap_opendir(const char *path)
 void PS2_FatalScreen(const char *text)
 {
     printf("[XASH-PS2] SYS_ERROR %s\n", text);
+    ps2_fatal_shown = 1;
     init_scr();
-    scr_printf("\n\n  Xash3D PS2 error:\n\n  %s\n\n  See boot.log next to the ELF.\n", text);
+    scr_printf("\n\n  Xash3D PS2 error:\n\n  %s\n%s", text,
+        XASH_PS2_RELEASE ? "" : "\n  See boot.log next to the ELF.\n");
     for (;;) DelayThread(1000000);
 }
 
@@ -512,12 +530,36 @@ static void ps2_wd_alarm(s32 id, u16 time, void *common)
     iSetAlarm(0xFFFF, ps2_wd_alarm, NULL);
 }
 
+/* pc 00082000 is the kernel idle loop: every thread waits. Show who waits on
+ * what (st 4 = WAIT; wt 1 = sleep, 2 = semaphore wid): func names the thread
+ * (symbolize.ps1). Screen first: printf blocks if the IOP is gone. */
+static void ps2_wd_dump_threads(void)
+{
+    ee_thread_status_t st;
+    char line[96];
+    int id, n;
+    static char all[2048];
+    size_t used = 0;
+    for (id = 1, n = 0; id < 256 && n < 16; id++)
+    {
+        if (ReferThreadStatus(id, &st) < 0 || st.status == THS_DORMANT) continue;
+        snprintf(line, sizeof(line), "  t%d func=%08x st=%x pr=%d wt=%u wid=%u wk=%u\n",
+            id, (unsigned)st.func, st.status, st.current_priority,
+            (unsigned)st.waitType, (unsigned)st.waitId, (unsigned)st.wakeupCount);
+        scr_printf("%s", line);
+        used += snprintf(all + used, sizeof(all) - used, "[XASH-PS2] HANG_THREAD%s", line + 1);
+        if (used >= sizeof(all)) break;
+        n++;
+    }
+    printf("%s", all);
+}
+
 static void ps2_wd_main(void *arg)
 {
     for (;;)
     {
         SleepThread();
-        if (ps2_ex_count) continue; // the exception report owns the screen; its idle loop is not a hang
+        if (ps2_ex_count || ps2_fatal_shown) continue; // an error screen owns the TV; its idle loop is not a hang
         if (ps2_wd_idle < 3)
             printf("[XASH-PS2] WATCHDOG_ARMED pc=%08x\n", (unsigned)ps2_wd_pc[0]);
         else
@@ -530,6 +572,7 @@ static void ps2_wd_main(void *arg)
             scr_printf("\n\n  HANG pc=%08x %08x %08x\n  last_io=%s",
                 (unsigned)ps2_wd_pc[0], (unsigned)ps2_wd_pc[1], (unsigned)ps2_wd_pc[2],
                 ps2_io_last[0] ? ps2_io_last + 11 : "none\n");
+            ps2_wd_dump_threads();
             printf("[XASH-PS2] HANG pc=%08x %08x %08x last_io=%s",
                 (unsigned)ps2_wd_pc[0], (unsigned)ps2_wd_pc[1], (unsigned)ps2_wd_pc[2],
                 ps2_io_last[0] ? ps2_io_last + 11 : "none\n");
