@@ -25,6 +25,8 @@ GNU General Public License for more details.
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#else
+#include <direct.h> // getcwd
 #endif
 #if XASH_EMSCRIPTEN
 #include <emscripten/emscripten.h>
@@ -40,6 +42,10 @@ GNU General Public License for more details.
 #include "input.h"
 #include "enginefeatures.h"
 #include "render_api.h"	// decallist_t
+#include "ps2_perf.h"
+#if XASH_PS2
+#include "fs_paths_ps2.h"
+#endif
 #if XASH_PSP
 #include "platform/psp/psp_perf.h"
 #endif
@@ -674,6 +680,7 @@ void Host_Frame( float time )
 		PSP_NetFrame(); // ad-hoc join, one step per frame
 	}
 #endif
+	PS2_PERF_BEGIN( FRAME );
 	Host_ClientBegin (); // begin client
 	Host_GetCommands (); // dedicated in
 #if XASH_PSP
@@ -681,12 +688,24 @@ void Host_Frame( float time )
 	Host_ServerFrame (); // server frame
 	psp_perf.server += Sys_DoubleTime() - perf_server;
 #else
-	Host_ServerFrame (); // server frame
+	{
+		PS2_PERF_BEGIN( SV );
+		Host_ServerFrame (); // server frame
+		PS2_PERF_END( SV );
+	}
 #endif
-	Host_ClientFrame (); // client frame
+	{
+		PS2_PERF_BEGIN( CL );
+		Host_ClientFrame (); // client frame
+		PS2_PERF_END( CL );
+	}
 	HTTP_Run();			 // both server and client
 
 	host.framecount++;
+	PS2_PERF_END( FRAME );
+#if XASH_PS2
+	PS2_Perf_EndFrame();
+#endif
 
 #if XASH_PSP
 	perf_frame = Sys_DoubleTime() - perf_start;
@@ -957,6 +976,13 @@ void Host_InitCommon( int argc, char **argv, const char *progname, qboolean bCha
 
 	baseDir = getenv( "XASH3D_BASEDIR" );
 
+#if XASH_PS2
+	if( !PS2_FS_Init( baseDir ))
+		Sys_Error( "PS2: no installation found. Keep valve/ and cstrike/ beside the ELF, including their liblist.gam files." );
+	if( Q_strlen( PS2_FS_Root() ) >= sizeof( host.rootdir ))
+		Sys_Error( "PS2: installation path exceeds engine rootdir capacity." );
+	Q_strncpy( host.rootdir, PS2_FS_Root(), sizeof( host.rootdir ));
+#else
 	if( COM_CheckString( baseDir ) )
 	{
 		Q_strncpy( host.rootdir, baseDir, sizeof(host.rootdir) );
@@ -983,8 +1009,10 @@ void Host_InitCommon( int argc, char **argv, const char *progname, qboolean bCha
 		}
 #endif
 	}
+#endif // XASH_PS2
 
-	if( host.rootdir[Q_strlen( host.rootdir ) - 1] == '/' )
+	if( Q_strlen( host.rootdir ) > 1 && host.rootdir[Q_strlen( host.rootdir ) - 1] == '/' &&
+		host.rootdir[Q_strlen( host.rootdir ) - 2] != ':' )
 		host.rootdir[Q_strlen( host.rootdir ) - 1] = 0;
 
 	// get readonly root. The order is: check for arg, then env.
@@ -1001,10 +1029,16 @@ void Host_InitCommon( int argc, char **argv, const char *progname, qboolean bCha
 	if( host.rodir[0] && host.rodir[Q_strlen( host.rodir ) - 1] == '/' )
 		host.rodir[Q_strlen( host.rodir ) - 1] = 0;
 
+#if XASH_PS2
+	/* PS2 newlib chdir support differs across loaders. FS routes every
+	 * physical lookup through the cached root, independent of the CWD. */
+	Con_Reportf( "%s is the cached PS2 asset root\n", host.rootdir );
+#else
 	if ( !host.rootdir[0] || SetCurrentDirectory( host.rootdir ) != 0)
 		Con_Reportf( "%s is working directory now\n", host.rootdir );
 	else
 		Sys_Error( "Changing working directory to %s failed.\n", host.rootdir );
+#endif
 
 #if XASH_PSP
 	{
@@ -1068,6 +1102,10 @@ Host_Main
 int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGame, pfnChangeGame func )
 {
 	static double	oldtime, newtime;
+	#if XASH_PS2
+	unsigned int ps2_frame_number = 0;
+	extern volatile unsigned int ps2_wd_progress; // sys_ps2.c hang watchdog
+	#endif
 
 	pChangeGame = func;	// may be NULL
 
@@ -1115,7 +1153,13 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
 	}
 
 	SV_Init();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=SERVER_ENGINE_READY\n" );
+	#endif
 	CL_Init();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_ENGINE_READY\n" );
+	#endif
 
 	HTTP_Init();
 	ID_Init();
@@ -1161,7 +1205,13 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
 	host.change_game = false;	// done
 	Cmd_RemoveCommand( "setgl" );
 	Cbuf_ExecStuffCmds();	// execute stuffcmds (commandline)
+#if XASH_PS2
+	SCR_BootStatus( "Starting menu", 4, 5 );
+#endif
 	SCR_CheckStartupVids();	// must be last
+#if XASH_PS2
+	SCR_BootEnd();
+#endif
 
 	oldtime = Sys_DoubleTime() - 0.1;
 
@@ -1176,11 +1226,26 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
 	}
 
 	// main window message loop
+		#if XASH_PS2
+		printf( "[XASH-PS2] STAGE=HOST_FRAME_LOOP_BEGIN\n" );
+		#endif
 	while( !host.crashed )
 	{
 		newtime = Sys_DoubleTime ();
 		COM_Frame( newtime - oldtime );
 		oldtime = newtime;
+			#if XASH_PS2
+			++ps2_frame_number;
+			++ps2_wd_progress; // a running frame loop is not a hang, even with no printf
+			if( ps2_frame_number == 60 )
+				printf( "[XASH-PS2] STAGE=HOST_FRAME_60\n" );
+			if( ps2_frame_number % 120 == 0 && ps2_frame_number <= 1800 )
+				printf( "[XASH-PS2] STAGE=HOST_FRAME_%u client_state=%d video_prepped=%d world=%p key_dest=%d\n",
+					ps2_frame_number, cls.state, cl.video_prepped, (void *)cl.worldmodel, cls.key_dest );
+			if( cls.state == ca_active && ps2_frame_number <= 1800 && (ps2_frame_number % 120 == 1))
+				printf( "[XASH-PS2] STAGE=CLIENT_ACTIVE frame=%u world=%p video=%d\n",
+					ps2_frame_number, (void *)cl.worldmodel, cl.video_prepped );
+			#endif
 	}
 
 	// never reached

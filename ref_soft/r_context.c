@@ -15,6 +15,11 @@ GNU General Public License for more details.
 
 #include "r_local.h"
 
+#if XASH_PS2
+/* The engine exposes the loaded model table to Studio cache users. */
+extern model_t *Mod_PSPKnownModel( int index );
+#endif
+
 ref_api_t      gEngfuncs;
 ref_globals_t *gpGlobals;
 gl_globals_t tr;
@@ -86,6 +91,10 @@ void Mod_UnloadTextures( model_t *mod );
 qboolean GAME_EXPORT Mod_ProcessRenderData( model_t *mod, qboolean create, const byte *buf )
 {
 	qboolean loaded = true;
+	#if XASH_PS2
+	qboolean ps2HudSprite = mod->type == mod_sprite && !Q_strnicmp( mod->name, "sprites/640hud", 14 );
+	if( ps2HudSprite ) printf( "[XASH-PS2] STAGE=HUD_RENDERDATA_BEGIN name=%s create=%d\n", mod->name, create );
+	#endif
 
 	if( create )
 	{
@@ -98,6 +107,9 @@ qboolean GAME_EXPORT Mod_ProcessRenderData( model_t *mod, qboolean create, const
 				break;
 			case mod_sprite:
 				Mod_LoadSpriteModel( mod, buf, &loaded, mod->numtexinfo );
+					#if XASH_PS2
+					if( ps2HudSprite ) printf( "[XASH-PS2] STAGE=HUD_RENDERDATA_SPRITE_LOADED name=%s loaded=%d\n", mod->name, loaded );
+					#endif
 				break;
 			case mod_alias:
 				//Mod_LoadAliasModel( mod, buf, &loaded );
@@ -110,8 +122,14 @@ qboolean GAME_EXPORT Mod_ProcessRenderData( model_t *mod, qboolean create, const
 		}
 	}
 
+	#if XASH_PS2
+	if( ps2HudSprite ) printf( "[XASH-PS2] STAGE=HUD_RENDERDATA_USER_CALLBACK name=%s ptr=%p\n", mod->name, (void *)gEngfuncs.drawFuncs->Mod_ProcessUserData );
+	#endif
 	if( loaded && gEngfuncs.drawFuncs->Mod_ProcessUserData )
 		gEngfuncs.drawFuncs->Mod_ProcessUserData( mod, create, buf );
+	#if XASH_PS2
+	if( ps2HudSprite ) printf( "[XASH-PS2] STAGE=HUD_RENDERDATA_RETURN name=%s\n", mod->name );
+	#endif
 
 	if( !create )
 		Mod_UnloadTextures( mod );
@@ -275,16 +293,39 @@ void Mod_BrushUnloadTextures( model_t *mod )
 	}
 }
 
+#if XASH_PS2
+/* PS2 keeps one byte-identical player.mdl as an alias of gign.mdl. Its
+ * Studio header (and texture indices) belong to the original model, so
+ * releasing them when the alias goes away would invalidate the owner. */
+static qboolean Mod_PS2BorrowsStudioTextures( const model_t *mod )
+{
+	model_t *other;
+	int i;
+
+	if( Q_stricmp( mod->name, "models/player.mdl" ) || !mod->cache.data )
+		return false;
+
+	for( i = 0; (other = Mod_PSPKnownModel( i )) != NULL; i++ )
+	{
+		if( other != mod && other->mempool && other->type == mod_studio &&
+			other->cache.data == mod->cache.data )
+			return true;
+	}
+	return false;
+}
+#endif
+
 void Mod_UnloadTextures( model_t *mod )
 {
-	int		i, j;
-
 	Assert( mod != NULL );
 
 	switch( mod->type )
 	{
 	case mod_studio:
-		//Mod_StudioUnloadTextures( mod->cache.data );
+			#if XASH_PS2
+			if( !Mod_PS2BorrowsStudioTextures( mod ))
+				Mod_StudioUnloadTextures( mod->cache.data );
+			#endif
 		break;
 	case mod_alias:
 		//Mod_AliasUnloadTextures( mod->cache.data );

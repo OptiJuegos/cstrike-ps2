@@ -559,6 +559,10 @@ static int GAME_EXPORT pfnPIC_Width( HIMAGE hPic )
 {
 	int	picWidth;
 
+#if XASH_PS2
+	// menu layouts use the authored size, which may exceed the capped copy in memory
+	return REF_GET_PARM( PARM_TEX_SRC_WIDTH, hPic );
+#endif
 	R_GetTextureParms( &picWidth, NULL, hPic );
 
 	return picWidth;
@@ -574,6 +578,9 @@ static int GAME_EXPORT pfnPIC_Height( HIMAGE hPic )
 {
 	int	picHeight;
 
+#if XASH_PS2
+	return REF_GET_PARM( PARM_TEX_SRC_HEIGHT, hPic );
+#endif
 	R_GetTextureParms( NULL, &picHeight, hPic );
 
 	return picHeight;
@@ -1253,6 +1260,9 @@ qboolean UI_LoadProgs( void )
 	int			i;
 
 	if( gameui.hInstance ) UI_UnloadProgs();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=MENU_LOAD_BEGIN\n" );
+	#endif
 
 	// setup globals
 	gameui.globals = &gpGlobals;
@@ -1302,6 +1312,9 @@ qboolean UI_LoadProgs( void )
 		gameui.hInstance = NULL;
 		return false;
 	}
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=MENU_API_READY\n" );
+	#endif
 
 	// make local copy of engfuncs to prevent overwrite it with user dll
 	memcpy( &gpExtendedfuncs, &gExtendedfuncs, sizeof( gExtendedfuncs ));
@@ -1339,6 +1352,9 @@ qboolean UI_LoadProgs( void )
 	}
 
 	Cvar_FullSet( "host_gameuiloaded", "1", FCVAR_READ_ONLY );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=MENU_API_EXTENDED_READY\n" );
+	#endif
 
 	// setup gameinfo
 	for( i = 0; i < SI.numgames; i++ )
@@ -1354,6 +1370,9 @@ qboolean UI_LoadProgs( void )
 
 	// initialize game
 	gameui.dllFuncs.pfnInit();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=MENU_INITIALIZED\n" );
+	#endif
 
 	return true;
 }

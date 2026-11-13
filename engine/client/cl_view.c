@@ -20,6 +20,8 @@ GNU General Public License for more details.
 #include "vgui_draw.h"
 #include "sound.h"
 #include "input.h" // touch
+#include "ps2_perf.h"
+#include "cl_split.h"
 #include "platform/platform.h" // GL_UpdateSwapInterval
 #if XASH_PSP
 #include "platform/psp/psp_perf.h"
@@ -258,7 +260,8 @@ void V_GetRefParams( ref_params_t *fd, ref_viewpass_t *rvp )
 	rvp->fov_y = V_CalcFov( &rvp->fov_x, clgame.viewport[2], clgame.viewport[3] );
 
 	// adjust FOV for widescreen
-	if( refState.wideScreen && r_adjust_fov->value )
+	// splitscreen views are 640x224: keep the 4:3 vertical angle (Hor+) instead of zooming in
+	if(( refState.wideScreen && r_adjust_fov->value ) || V_SplitActive( ))
 		V_AdjustFov( &rvp->fov_x, &rvp->fov_y, clgame.viewport[2], clgame.viewport[3], false );
 
 	rvp->flags = 0;
@@ -312,11 +315,102 @@ V_RenderView
 
 ==================
 */
+// splitscreen: top of player 2's view in screen pixels, 0 when off
+static int v_split_top;
+
+qboolean V_SplitActive( void )
+{
+	return v_split_top > 0;
+}
+
+/*
+==================
+V_RenderSplitView
+
+Player 2 in the bottom half. While it draws, the engine treats player 2 as
+the local player, so the ref hides player 2's model and shows player 1's.
+==================
+*/
+static void V_RenderSplitView( ref_viewpass_t *rvp, int entnum, const vec3_t origin, const vec3_t angles, float fov )
+{
+	int	oldplayer = cl.playernum, oldview = cl.viewentity, oldhealth = cl.local.health;
+	cl_entity_t	oldviewent = clgame.viewent;
+	vec3_t	saved[5];
+
+	VectorCopy( refState.vieworg, saved[0] );
+	VectorCopy( refState.viewangles, saved[1] );
+	VectorCopy( refState.vforward, saved[2] );
+	VectorCopy( refState.vright, saved[3] );
+	VectorCopy( refState.vup, saved[4] );
+
+	rvp->viewport[1] = v_split_top;
+	rvp->viewport[3] = refState.height - v_split_top;
+	VectorCopy( origin, rvp->vieworigin );
+	VectorCopy( angles, rvp->viewangles );
+	rvp->viewentity = entnum;
+	rvp->fov_x = fov;
+	rvp->fov_y = V_CalcFov( &rvp->fov_x, rvp->viewport[2], rvp->viewport[3] );
+	V_AdjustFov( &rvp->fov_x, &rvp->fov_y, rvp->viewport[2], rvp->viewport[3], false ); // Hor+, as player 1
+	rvp->flags = RF_DRAW_WORLD;
+
+	cl.playernum = entnum - 1;
+	cl.viewentity = entnum;
+	// player 2's weapon replaces player 1's; the ref draws it only with health
+	qboolean viewmodel = CL_SplitViewModel( &clgame.viewent, origin, angles );
+
+	if( viewmodel )
+		cl.local.health = 1;
+	else clgame.viewent.model = NULL;
+
+	// player 1's view already moved particles, beams and dlights this frame: draw only
+	double oldtime = refState.oldtime;
+	refState.oldtime = refState.time;
+	GL_RenderFrame( rvp );
+	refState.oldtime = oldtime;
+	if( viewmodel )
+		CL_SplitViewModelDone( &clgame.viewent );
+	S_UpdateSplitListener( rvp );
+
+	cl.playernum = oldplayer;
+	cl.viewentity = oldview;
+	cl.local.health = oldhealth;
+	clgame.viewent = oldviewent;
+
+	VectorCopy( saved[0], refState.vieworg );
+	VectorCopy( saved[1], refState.viewangles );
+	VectorCopy( saved[2], refState.vforward );
+	VectorCopy( saved[3], refState.vright );
+	VectorCopy( saved[4], refState.vup );
+}
+
+// player 2's 2D: crosshair, text HUD and menus; the client library draws player 1's
+static void V_DrawSplitCrosshair( float x, float y )
+{
+	ref.dllFuncs.FillRGBA( x - 6, y, 4, 1, 0, 255, 0, 200 );
+	ref.dllFuncs.FillRGBA( x + 3, y, 4, 1, 0, 255, 0, 200 );
+	ref.dllFuncs.FillRGBA( x, y - 6, 1, 4, 0, 255, 0, 200 );
+	ref.dllFuncs.FillRGBA( x, y + 3, 1, 4, 0, 255, 0, 200 );
+}
+
+// both players get the same crosshair; the client library hides its own (_split_active)
+static void V_DrawSplitHud( void )
+{
+	float x = clgame.viewport[0] + clgame.viewport[2] * 0.5f;
+
+	V_DrawSplitCrosshair( x, clgame.viewport[1] + clgame.viewport[3] * 0.5f );
+	V_DrawSplitCrosshair( x, v_split_top + ( refState.height - v_split_top ) * 0.5f );
+	ref.dllFuncs.FillRGBA( 0, v_split_top - 1, refState.width, 2, 0, 0, 0, 255 );
+	CL_SplitDrawHud( clgame.viewport[0], v_split_top, clgame.viewport[2], refState.height - v_split_top );
+}
+
 void V_RenderView( void )
 {
 	ref_params_t	rp;
 	ref_viewpass_t	rvp;
 	int		viewnum = 0;
+	int		p2_entnum;
+	vec3_t	p2_origin, p2_angles;
+	float	p2_fov;
 
 	if( !cl.video_prepped || ( !ui_renderworld->value && UI_IsVisible() && !cl.background ))
 		return; // still loading
@@ -324,8 +418,27 @@ void V_RenderView( void )
 #if XASH_PSP
 	double perf_start = Sys_DoubleTime();
 #endif
+	PS2_PERF_BEGIN( VIEW );
 
 	V_CalcViewRect ();	// compute viewport rectangle
+	{
+		int top = 0;
+
+		if( CL_SplitView( &p2_entnum, p2_origin, p2_angles, &p2_fov ))
+		{
+			clgame.viewport[3] /= 2; // player 1 gets the top half
+			top = clgame.viewport[1] + clgame.viewport[3];
+		}
+
+		// the client library reads the HUD size only in VidInit
+		if( !top != !v_split_top )
+		{
+			v_split_top = top;
+			_split_active.value = top ? 1.0f : 0.0f;
+			clgame.dllFuncs.pfnVidInit();
+		}
+		v_split_top = top;
+	}
 	V_SetRefParams( &rp );
 	V_SetupViewModel ();
 	ref.dllFuncs.R_Set2DMode( false );
@@ -349,10 +462,15 @@ void V_RenderView( void )
 
 	} while( rp.nextView );
 
+	if( v_split_top > 0 )
+		V_RenderSplitView( &rvp, p2_entnum, p2_origin, p2_angles, p2_fov );
+	else S_UpdateSplitListener( NULL );
+
 	// draw debug triangles on a server
 	SV_DrawDebugTriangles ();
 	ref.dllFuncs.GL_BackendEndFrame ();
 
+	PS2_PERF_END( VIEW );
 #if XASH_PSP
 	psp_perf.scene += Sys_DoubleTime() - perf_start;
 #endif
@@ -471,9 +589,13 @@ void V_PostRender( void )
 #if XASH_PSP
 		double perf_start = Sys_DoubleTime();
 #endif
+		PS2_PERF_BEGIN( HUD );
 		SCR_TileClear();
 		CL_DrawHUD( CL_ACTIVE );
+		if( v_split_top > 0 )
+			V_DrawSplitHud();
 		VGui_Paint();
+		PS2_PERF_END( HUD );
 #if XASH_PSP
 		psp_perf.hud += Sys_DoubleTime() - perf_start;
 #endif
@@ -499,7 +621,8 @@ void V_PostRender( void )
 		ref.dllFuncs.R_ShowTextures();
 		R_ShowTree();
 		Con_DrawConsole();
-		UI_UpdateMenu( host.realtime );
+		if( !CL_IntroDraw( ))
+			UI_UpdateMenu( host.realtime );
 		Con_DrawVersion();
 		Con_DrawDebug(); // must be last
 		Touch_Draw();

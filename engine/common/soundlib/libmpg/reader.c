@@ -14,10 +14,21 @@ GNU General Public License for more details.
 */
 
 #include "mpg123.h"
+#include "build.h"
 #ifdef _WIN32
 #include <io.h>
 #else
 #include <unistd.h>
+#endif
+
+#if XASH_PS2
+/* PS2SDK's off_t may differ in width from the old mpg123 mpg_off_t. Keep
+ * the actual POSIX file seek and convert explicitly, never call through
+ * an incompatible function pointer type on the R5900 ABI. */
+static mpg_off_t ps2_mpg_lseek(int fd, mpg_off_t offset, int whence)
+{
+    return (mpg_off_t)lseek(fd, (off_t)offset, whence);
+}
 #endif
 
 #define READER_STREAM	0
@@ -857,7 +868,11 @@ static int default_init( mpg123_handle_t *fr )
 {
 	fr->rdat.fdread = plain_read;
 	fr->rdat.read = fr->rdat.r_read  != NULL ? fr->rdat.r_read  : read;
+	#if XASH_PS2
+	fr->rdat.lseek = fr->rdat.r_lseek != NULL ? fr->rdat.r_lseek : ps2_mpg_lseek;
+	#else
 	fr->rdat.lseek = fr->rdat.r_lseek != NULL ? fr->rdat.r_lseek : lseek;
+	#endif
 	fr->rdat.filelen = get_fileinfo( fr );
 	fr->rdat.filepos = 0;
 

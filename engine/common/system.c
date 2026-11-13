@@ -429,6 +429,12 @@ void Sys_Error( const char *error, ... )
 	Q_vsprintf( text, error, argptr );
 	va_end( argptr );
 
+#if XASH_PS2
+	{
+		void PS2_FatalScreen( const char *text );
+		PS2_FatalScreen( text );
+	}
+#endif
 	SV_SysError( text );
 
 	if( !Host_IsDedicated() )

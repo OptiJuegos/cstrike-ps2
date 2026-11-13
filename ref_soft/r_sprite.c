@@ -68,7 +68,15 @@ static const dframetype_t *R_SpriteLoadFrame( model_t *mod, const void *pin, msp
 	if( FBitSet( mod->flags, MODEL_CLIENT )) // it's a HUD sprite
 	{
 		Q_snprintf( texname, sizeof( texname ), "#HUD/%s(%s:%i%i).spr", sprite_name, group_suffix, num / 10, num % 10 );
+			#if XASH_PS2
+			if( !Q_strnicmp( sprite_name, "sprites/640hud", 14 ))
+				printf( "[XASH-PS2] STAGE=HUD_SPRITE_FRAME_BEGIN name=%s size=%dx%d flags=%u\n", texname, pinframe.width, pinframe.height, (unsigned)r_texFlags );
+			#endif
 		gl_texturenum = GL_LoadTexture( texname, pin, pinframe.width * pinframe.height * bytes, r_texFlags );
+			#if XASH_PS2
+			if( !Q_strnicmp( sprite_name, "sprites/640hud", 14 ))
+				printf( "[XASH-PS2] STAGE=HUD_SPRITE_FRAME_UPLOADED name=%s id=%d\n", texname, gl_texturenum );
+			#endif
 	}
 	else
 	{
@@ -86,6 +94,10 @@ static const dframetype_t *R_SpriteLoadFrame( model_t *mod, const void *pin, msp
 	pspriteframe->right = pinframe.width + pinframe.origin[0];
 	pspriteframe->gl_texturenum = gl_texturenum;
 	*ppframe = pspriteframe;
+		#if XASH_PS2
+		if( FBitSet( mod->flags, MODEL_CLIENT ) && !Q_strnicmp( sprite_name, "sprites/640hud", 14 ))
+			printf( "[XASH-PS2] STAGE=HUD_SPRITE_FRAME_DONE name=%s\n", texname );
+		#endif
 
 	return ( const dframetype_t* )(( const byte* )pin + sizeof( dspriteframe_t ) + pinframe.width * pinframe.height * bytes );
 }
@@ -205,6 +217,10 @@ void Mod_LoadSpriteModel( model_t *mod, const void *buffer, qboolean *loaded, ui
 
 	for( i = 0; i < mod->numframes; i++ )
 	{
+			#if XASH_PS2
+			if( !Q_strnicmp( sprite_name, "sprites/640hud", 14 ))
+				printf( "[XASH-PS2] STAGE=HUD_SPRITE_LOOP_BEGIN name=%s i=%d count=%d\n", sprite_name, i, mod->numframes );
+			#endif
 		frametype_t frametype = pframetype->type;
 		psprite->frames[i].type = (spriteframetype_t)frametype;
 
@@ -224,7 +240,15 @@ void Mod_LoadSpriteModel( model_t *mod, const void *buffer, qboolean *loaded, ui
 			break;
 		}
 		if( pframetype == NULL ) break; // technically an error
+			#if XASH_PS2
+			if( !Q_strnicmp( sprite_name, "sprites/640hud", 14 ))
+				printf( "[XASH-PS2] STAGE=HUD_SPRITE_LOOP_DONE name=%s i=%d\n", sprite_name, i );
+			#endif
 	}
+		#if XASH_PS2
+		if( !Q_strnicmp( sprite_name, "sprites/640hud", 14 ))
+			printf( "[XASH-PS2] STAGE=HUD_SPRITE_MODEL_DONE name=%s\n", sprite_name );
+		#endif
 
 	if( loaded ) *loaded = true;	// done
 }
@@ -382,7 +406,10 @@ void Mod_SpriteUnloadTextures( void *data )
 
 				for( j = 0; j < pspritegroup->numframes; j++ )
 				{
-					pspriteframe = pspritegroup->frames[i];
+						// The outer index selects the sprite group; the inner
+						// index selects each frame owned by that group. Reusing i
+						// freed one texture repeatedly and leaked the other frames.
+						pspriteframe = pspritegroup->frames[j];
 					GL_FreeTexture( pspriteframe->gl_texturenum );
 				}
 			}

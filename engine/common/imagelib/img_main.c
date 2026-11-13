@@ -107,6 +107,9 @@ void Image_Reset( void )
 	image.rgba = NULL;
 	image.ptr = 0;
 	image.size = 0;
+#if XASH_PS2
+	image.borrow_source = false;
+#endif
 }
 
 rgbdata_t *ImagePack( void )
@@ -222,6 +225,11 @@ rgbdata_t *FS_LoadImage( const char *filename, const byte *buffer, size_t size )
 
 	Q_strncpy( loadname, filename, sizeof( loadname ));
 	Image_Reset(); // clear old image
+#if XASH_PS2
+	// #model and #sprite pixels are embedded in the caller's buffer, and
+	// ref_soft consumes them before FS_LoadImage returns to the caller.
+	image.borrow_source = ( filename[0] == '#' && buffer && size > 0 );
+#endif
 
 	if( Q_stricmp( ext, "" ))
 	{
@@ -445,7 +453,11 @@ free RGBA buffer
 void FS_FreeImage( rgbdata_t *pack )
 {
 	if( !pack ) return;
+#if XASH_PS2
+	if( pack->buffer && !FBitSet( pack->flags, IMAGE_BORROWED_PIXELS )) Mem_Free( pack->buffer );
+#else
 	if( pack->buffer ) Mem_Free( pack->buffer );
+#endif
 	if( pack->palette ) Mem_Free( pack->palette );
 	Mem_Free( pack );
 }
@@ -466,6 +478,10 @@ rgbdata_t *FS_CopyImage( rgbdata_t *in )
 
 	out = Mem_Malloc( host.imagepool, sizeof( rgbdata_t ));
 	*out = *in;
+#if XASH_PS2
+	// FS_CopyImage creates an owned copy even when the input borrowed pixels.
+	ClearBits( out->flags, IMAGE_BORROWED_PIXELS );
+#endif
 
 	switch( in->type )
 	{

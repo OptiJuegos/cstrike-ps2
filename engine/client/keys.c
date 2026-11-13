@@ -98,23 +98,44 @@ keyname_t keynames[] =
 {"KP_PLUS",	K_KP_PLUS,	""		},
 {"PAUSE",		K_PAUSE,		"pause"		},
 
-{"A_BUTTON", K_A_BUTTON, ""}, // they match xbox controller
-{"B_BUTTON", K_B_BUTTON, ""},
-{"X_BUTTON", K_X_BUTTON, ""},
-{"Y_BUTTON", K_Y_BUTTON, ""},
-{"L1_BUTTON",  K_L1_BUTTON, ""},
-{"R1_BUTTON",  K_R1_BUTTON, ""},
+	#if XASH_PS2
+	{"A_BUTTON", K_A_BUTTON, "+jump"}, // Cross
+	{"B_BUTTON", K_B_BUTTON, "+duck"}, // Circle
+	{"X_BUTTON", K_X_BUTTON, "+reload"}, // Square
+	{"Y_BUTTON", K_Y_BUTTON, "+use"}, // Triangle
+	{"L1_BUTTON", K_L1_BUTTON, "invprev"},
+	{"R1_BUTTON", K_R1_BUTTON, "invnext"},
+	#else
+	{"A_BUTTON", K_A_BUTTON, ""}, // they match xbox controller
+	{"B_BUTTON", K_B_BUTTON, ""},
+	{"X_BUTTON", K_X_BUTTON, ""},
+	{"Y_BUTTON", K_Y_BUTTON, ""},
+	{"L1_BUTTON", K_L1_BUTTON, ""},
+	{"R1_BUTTON", K_R1_BUTTON, ""},
+	#endif
 {"BACK",   K_BACK_BUTTON, ""},
-{"MODE",   K_MODE_BUTTON, ""},
-#if XASH_PSP
+	{"MODE",   K_MODE_BUTTON,
+	#if XASH_PS2
+		"buy"},
+	#else
+		""},
+	#endif
+#if XASH_PSP || XASH_PS2
 {"START",  K_START_BUTTON, "escape"}, // hardcoded
 #else
 {"START",  K_START_BUTTON, ""},
 #endif
-{"STICK1", K_LSTICK, ""},
-{"STICK2", K_RSTICK, ""},
-{"L2_BUTTON", K_L2_BUTTON, ""}, // in case...
-{"R2_BUTTON", K_R2_BUTTON, ""},
+	#if XASH_PS2
+	{"STICK1", K_LSTICK, "+speed"},
+	{"STICK2", K_RSTICK, "lastinv"},
+	{"L2_BUTTON", K_L2_BUTTON, "+attack2"},
+	{"R2_BUTTON", K_R2_BUTTON, "+attack"},
+	#else
+	{"STICK1", K_LSTICK, ""},
+	{"STICK2", K_RSTICK, ""},
+	{"L2_BUTTON", K_L2_BUTTON, ""}, // in case...
+	{"R2_BUTTON", K_R2_BUTTON, ""},
+	#endif
 {"C_BUTTON", K_C_BUTTON, ""},
 {"Z_BUTTON", K_Z_BUTTON, ""},
 {"AUX16", K_AUX16, ""}, // generic
@@ -375,6 +396,9 @@ Key_Unbindall_f
 void Key_Unbindall_f( void )
 {
 	int	i;
+	#if XASH_PS2
+	keyname_t *kn;
+	#endif
 	
 	for( i = 0; i < 256; i++ )
 	{
@@ -384,9 +408,16 @@ void Key_Unbindall_f( void )
 
 	// set some defaults
 	Key_SetBinding( K_ESCAPE, "escape" );
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	Key_SetBinding( K_START_BUTTON, "escape" );
 #endif
+	#if XASH_PS2
+	// A stock PC config.cfg starts with unbindall. Restore PS2 pad defaults
+	// before its explicit bind commands (which remain free to override them).
+	for( kn = keynames; kn->name; kn++ )
+		if( kn->keynum >= K_A_BUTTON && kn->keynum <= K_R2_BUTTON && kn->binding[0] )
+			Key_SetBinding( kn->keynum, kn->binding );
+	#endif
 }
 
 /*
@@ -526,7 +557,7 @@ void Key_Init( void )
 
 	// setup default binding. "unbindall" from config.cfg will be reset it
 	for( kn = keynames; kn->name; kn++ ) Key_SetBinding( kn->keynum, kn->binding ); 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	osk_enable = Cvar_Get( "osk_enable", "1", FCVAR_ARCHIVE, "enable built-in on-screen keyboard" );
 #else
 	osk_enable = Cvar_Get( "osk_enable", "0", FCVAR_ARCHIVE, "enable built-in on-screen keyboard" );
@@ -663,6 +694,9 @@ void GAME_EXPORT Key_Event( int key, int down )
 	if( OSK_KeyEvent( key, down ) )
 		return;
 
+	if( CL_IntroKeyEvent( key, down ))
+		return;
+
 	// key was pressed before engine was run
 	if( !keys[key].down && !down )
 		return;
@@ -721,8 +755,8 @@ void GAME_EXPORT Key_Event( int key, int down )
 	Touch_KeyEvent( key, down );
 
 	// console key is hardcoded, so the user can never unbind it
-#if XASH_PSP
-	// SELECT only toggles the console outside of the game: the PSP has few
+#if XASH_PSP || XASH_PS2
+		// SELECT only toggles the console outside of the game: handheld/PS2
 	// buttons, in game it is a normal bindable key ("MODE", buy in CS)
 	if( key == '`' || key == '~' || ( key == K_MODE_BUTTON && cls.key_dest != key_game ))
 #else
@@ -738,7 +772,7 @@ void GAME_EXPORT Key_Event( int key, int down )
 	}
 
 	// escape is always handled special
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	if( ( key == K_ESCAPE || key == K_START_BUTTON ) && down )
 #else
 	if( key == K_ESCAPE && down )
@@ -907,7 +941,7 @@ Normal keyboard characters, already shifted / capslocked / etc
 void CL_CharEvent( int key )
 {
 	// the console key should never be used as a char
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	if( key == '`' || key == '~' || key == K_MODE_BUTTON ) return;
 #else
 	if( key == '`' || key == '~' ) return;
@@ -1036,7 +1070,7 @@ static qboolean OSK_KeyEvent( int key, int down )
 
 	if( osk.curbutton.val == 0 )
 	{
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 		if( key == K_ENTER || key == K_A_BUTTON )
 #else
 		if( key == K_ENTER )
@@ -1051,7 +1085,11 @@ static qboolean OSK_KeyEvent( int key, int down )
 
 	switch ( key )
 	{
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
+	case K_Y_BUTTON: // triangle hides the keyboard, cross on the field brings it back
+		if( down )
+			osk.curbutton.val = 0;
+		return true;
 	case K_A_BUTTON:
 #endif
 	case K_ENTER:

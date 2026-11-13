@@ -1,6 +1,8 @@
 #include "r_local.h"
+#if !XASH_PS2
 #define APIENTRY_LINKAGE static
 #include "../ref_gl/gl_export.h"
+#endif
 
 struct swblit_s
 {
@@ -50,6 +52,7 @@ DebugCallback
 For ARB_debug_output
 ========================
 */
+#if !XASH_PS2
 static void APIENTRY GL_DebugOutput( GLuint source, GLuint type, GLuint id, GLuint severity, GLint length, const GLcharARB *message, GLvoid *userParam )
 {
 	switch( type )
@@ -415,6 +418,11 @@ static qboolean R_CreateBuffer_GLES3( int width, int height, uint *stride, uint 
 	return true;
 }
 
+#else /* XASH_PS2: keep original indexed software blitter, not OpenGL. */
+void GAME_EXPORT GL_SetupAttributes( int safe ) { (void)safe; }
+void GAME_EXPORT GL_InitExtensions( void ) {}
+void GAME_EXPORT GL_ClearExtensions( void ) {}
+#endif
 
 
 static int FIRST_BIT( uint mask )
@@ -488,10 +496,19 @@ void R_BuildScreenMap( void )
 			//vid.screen[(i<<8)|j] = r << (6 + 5) | (g << 5) | b | major;
 			minor = (r * rmult / rdiv) << rshift | (g * gmult / gdiv) << gshift | (b * bmult / bdiv) << bshift;
 
-			if( swblit.bpp == 2 )
-				vid.screen[(i<<8)|j] = major | minor;
+				if( swblit.bpp == 2 )
+				{
+					vid.screen[(i<<8)|j] = major | minor;
+#if XASH_PS2
+					/* GS CT16 uses bit 15 for alpha. Set it once here so
+					 * the platform does not scan the texture each frame. */
+					vid.screen[(i<<8)|j] |= 0x8000;
+#endif
+				}
+			#if !XASH_PS2
 			else
 				vid.screen32[(i<<8)|j] = major | minor;
+			#endif
 
 		}
 
@@ -500,6 +517,38 @@ void R_BuildScreenMap( void )
 }
 
 #define FOR_EACH_COLOR(x) 	for( r##x = 0; r##x < BIT(3); r##x++ ) for( g##x = 0; g##x < BIT(3); g##x++ ) for( b##x = 0; b##x < BIT(2); b##x++ )
+
+#if XASH_PS2
+byte r_ps2BlendR[3][32 * 8];
+byte r_ps2BlendG[3][64 * 8];
+byte r_ps2BlendB[3][32 * 4];
+static void R_PS2BuildCompactBlendMaps( void )
+{
+	uint k, a, x, y, value;
+	for( k = 0; k < 3; k++ )
+	{
+		a = k + 2;
+		for( x = 0; x < 32; x++ )
+			for( y = 0; y < 8; y++ )
+			{
+				value = x * (7 - a) / 7 + ((y << 2) | BIT(2)) * a / 7;
+				r_ps2BlendR[k][x * 8 + y] = Q_min( value, MASK(5) );
+			}
+		for( x = 0; x < 64; x++ )
+			for( y = 0; y < 8; y++ )
+			{
+				value = x * (7 - a) / 7 + ((y << 3) | MASK(2)) * a / 7;
+				r_ps2BlendG[k][x * 8 + y] = Q_min( value, MASK(6) );
+			}
+		for( x = 0; x < 32; x++ )
+			for( y = 0; y < 4; y++ )
+			{
+				value = x * (7 - a) / 7 + ((y << 3) | MASK(2)) * a / 7;
+				r_ps2BlendB[k][x * 4 + y] = Q_min( value, MASK(5) );
+			}
+	}
+}
+#endif
 
 void R_BuildBlendMaps( void )
 {
@@ -573,7 +622,7 @@ void R_BuildBlendMaps( void )
 			vid.colormap[index2|index1] =  major << 8 | (minor & 0xFF);
 		}
 	}
-#if 1
+#if !XASH_PS2
 	for( i = 0; i < 1024; i++ )
 	{
 		unsigned int r, g, b;
@@ -623,6 +672,8 @@ void R_BuildBlendMaps( void )
 			}
 		}
 	}
+#else
+	R_PS2BuildCompactBlendMaps();
 #endif
 }
 
@@ -632,6 +683,12 @@ void R_InitBlit( qboolean glblit )
 {
 	R_BuildBlendMaps();
 
+#if XASH_PS2
+	(void)glblit;
+	swblit.pLockBuffer = gEngfuncs.SW_LockBuffer;
+	swblit.pUnlockBuffer = gEngfuncs.SW_UnlockBuffer;
+	swblit.pCreateBuffer = gEngfuncs.SW_CreateBuffer;
+#else
 	if( glblit && swblit.gl1 )
 	{
 		swblit.pLockBuffer = R_Lock_GL1;
@@ -650,6 +707,7 @@ void R_InitBlit( qboolean glblit )
 		swblit.pUnlockBuffer = gEngfuncs.SW_UnlockBuffer;
 		swblit.pCreateBuffer = gEngfuncs.SW_CreateBuffer;
 	}
+#endif
 	R_AllocScreen();
 }
 
@@ -669,8 +727,12 @@ void R_AllocScreen( void )
 	else
 		h = gpGlobals->height, w = gpGlobals->width;
 
-	swblit.pCreateBuffer( w, h, &swblit.stride, &swblit.bpp,
-							   &swblit.rmask, &swblit.gmask, &swblit.bmask);
+	if( !swblit.pCreateBuffer( w, h, &swblit.stride, &swblit.bpp,
+								   &swblit.rmask, &swblit.gmask, &swblit.bmask ) )
+	{
+		gEngfuncs.Host_Error( "R_AllocScreen: software video buffer allocation failed (%dx%d)\n", w, h );
+		return;
+	}
 	R_BuildScreenMap();
 	vid.width = gpGlobals->width;
 	vid.height = gpGlobals->height;
@@ -721,6 +783,7 @@ void R_BlitScreen( void )
 				}
 			}
 		}
+		#if !XASH_PS2
 		else if( swblit.bpp == 4 )
 		{
 			unsigned int *pbuf = buffer;
@@ -758,6 +821,7 @@ void R_BlitScreen( void )
 				}
 			}
 		}
+			#endif
 	}
 	else
 	{
@@ -776,6 +840,7 @@ void R_BlitScreen( void )
 				}
 			}
 		}
+		#if !XASH_PS2
 		else if( swblit.bpp == 4 )
 		{
 			unsigned int *pbuf = buffer;
@@ -811,6 +876,7 @@ void R_BlitScreen( void )
 				}
 			}
 		}
+		#endif
 	}
 
 	swblit.pUnlockBuffer();

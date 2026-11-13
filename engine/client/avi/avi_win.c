@@ -138,7 +138,7 @@ qboolean AVI_ACMConvertAudio( movie_state_t *Avi )
 {
 	WAVEFORMATEX	dest_header, *sh, *dh;
 	AVISTREAMINFO	stream_info;
-	dword		dest_length;
+	DWORD		dest_length;
 	short		bits;
 
 	// WMA codecs, both versions - they simply don't work.
@@ -385,7 +385,7 @@ qboolean AVI_SeekPosition( movie_state_t *Avi, dword offset )
 // get a chunk of audio from the stream (in bytes)
 int AVI_GetAudioChunk( movie_state_t *Avi, char *audiodata, int offset, int length )
 {
-	int	result = 0;
+	LONG	result = 0;
 	int	i;
 
 	// zero data past the end of the file
@@ -558,7 +558,7 @@ void AVI_OpenVideo( movie_state_t *Avi, const char *filename, qboolean load_audi
 		}
 		else if( stream_info.fccType == streamtypeAUDIO && Avi->audio_stream == NULL && load_audio )
 		{
-			int	size;
+			LONG	size;
 
 			Avi->audio_stream = stream;
 

@@ -24,6 +24,9 @@ GNU General Public License for more details.
 #include "client.h"
 #include "server.h"			// LUMP_ error codes
 #include "ref_common.h"
+#if XASH_PS2
+#include <stdio.h>
+#endif
 typedef struct wadlist_s
 {
 	char			wadnames[MAX_MAP_WADS][32];
@@ -706,6 +709,9 @@ qboolean Mod_BoxVisible( const vec3_t mins, const vec3_t maxs, const byte *visbi
 		return true;
 
 	count = Mod_BoxLeafnums( mins, maxs, leafList, MAX_BOX_LEAFS, NULL );
+	// A full list may omit visible leaves. Keep the box when it saturates.
+	if( count == MAX_BOX_LEAFS )
+		return true;
 
 	for( i = 0; i < count; i++ )
 	{
@@ -891,7 +897,7 @@ Mod_GetFaceContents
 determine face contents by name
 ==================
 */
-static int Mod_GetFaceContents( const char *name )
+int Mod_GetFaceContents( const char *name )
 {
 	if( !Q_strnicmp( name, "SKY", 3 ))
 		return CONTENTS_SKY;
@@ -918,7 +924,7 @@ Mod_GetFaceContents
 determine face contents by name
 ==================
 */
-static mvertex_t *Mod_GetVertexByNumber( model_t *mod, int surfedge )
+mvertex_t *Mod_GetVertexByNumber( model_t *mod, int surfedge )
 {
 	int	lindex;
 	medge_t	*edge;
@@ -1122,13 +1128,14 @@ static void Mod_CalcSurfaceBounds( msurface_t *surf )
 }
 
 #if XASH_PSP
-// one block for all the bevels of a map instead of one per surface: dust2
+// One block for all the bevels of a map instead of one per surface: dust2
 // has 5383 surfaces and the allocator's own header on each ~120 byte bevel
-// added about a third to them (Mod_LoadSurfaces sets it up)
+// added about a third to them (Mod_LoadSurfaces sets it up).
 static byte	*bevel_arena;
 static size_t	bevel_arena_left;
 #endif
 
+#if !XASH_PS2 // PS2 computes these per trace, see PM_PointInFacet
 /*
 =================
 Mod_CreateFaceBevels
@@ -1158,8 +1165,10 @@ static void Mod_CreateFaceBevels( msurface_t *surf )
 		bevel_arena_left -= size;
 	}
 	else
-#endif
 	facebevel = (byte *)Mem_Calloc( loadmodel->mempool, size );
+#else
+	facebevel = (byte *)Mem_Calloc( loadmodel->mempool, size );
+#endif
 	fb = (mfacebevel_t *)facebevel;
 	facebevel += sizeof( mfacebevel_t );
 	fb->edges = (mplane_t *)facebevel;
@@ -1197,6 +1206,7 @@ static void Mod_CreateFaceBevels( msurface_t *surf )
 		fb->radius = Q_max( radius, fb->radius );
 	}
 }
+#endif // !XASH_PS2
 
 /*
 =================
@@ -2308,7 +2318,7 @@ static void Mod_LoadSurfaces( dbspmodel_t *bmod )
 
 		// setup crosslinks between two parts of msurface_t
 		out->info = info;
-		info->surf = out;
+			info->surf = out;
 
 		if( bmod->version == QBSP2_VERSION )
 		{
@@ -2379,7 +2389,9 @@ static void Mod_LoadSurfaces( dbspmodel_t *bmod )
 
 		Mod_CalcSurfaceBounds( out );
 		Mod_CalcSurfaceExtents( out );
+#if !XASH_PS2
 		Mod_CreateFaceBevels( out );
+#endif
 
 		// grab the second sample to detect colored lighting
 		if( test_lightsize > 0 && lightofs != -1 )
@@ -2708,12 +2720,29 @@ static void Mod_LoadLighting( dbspmodel_t *bmod )
 {
 	int		i, lightofs;
 	msurface_t	*surf;
+#if !XASH_PS2
 	color24		*out;
 	byte		*in;
+#endif
 
 	if( !bmod->lightdatasize )
 		return;
 
+#if XASH_PS2
+	// R_BuildLightMap adds R, G and B into one value, surfaces are already
+	// monochrome: keep one byte per luxel instead of three.
+	if( bmod->lightmap_samples == 1 || bmod->lightmap_samples == 3 )
+	{
+		const int	samples = bmod->lightmap_samples;
+		const int	count = bmod->lightdatasize / samples;
+		const byte	*src = bmod->lightdata;
+
+		loadmodel->lightdata = Mem_Malloc( loadmodel->mempool, count );
+		for( i = 0; i < count; i++, src += samples )
+			loadmodel->lightdata[i] = ( samples == 3 ) ? ( src[0] + src[1] + src[2] + 1 ) / 3 : src[0];
+	}
+	else Host_Error( "Mod_LoadLighting: bad lightmap sample count %i\n", bmod->lightmap_samples );
+#else
 	switch( bmod->lightmap_samples )
 	{
 	case 1:
@@ -2736,6 +2765,7 @@ static void Mod_LoadLighting( dbspmodel_t *bmod )
 		Host_Error( "Mod_LoadLighting: bad lightmap sample count %i\n", bmod->lightmap_samples );
 		break;
 	}
+#endif
 
 	// not supposed to be load ?
 	if( FBitSet( host.features, ENGINE_LOAD_DELUXEDATA ))
@@ -2769,8 +2799,10 @@ static void Mod_LoadLighting( dbspmodel_t *bmod )
 				surf->info->deluxemap = bmod->deluxedata_out + offset;
 
 			// will be used by mods
-			if( bmod->shadowdata_out )
+				#if !XASH_PS2
+				if( bmod->shadowdata_out )
 				surf->info->shadowmap = bmod->shadowdata_out + offset;
+				#endif
 		}
 	}
 }
@@ -2983,6 +3015,10 @@ void Mod_LoadBrushModel( model_t *mod, const void *buffer, qboolean *loaded )
 		return; // there were errors
 
 	if( world.loading ) worldmodel = mod;
+#if XASH_PS2
+	// the map's wad textures are uploaded: free their lump tables until next use
+	if( world.loading ) FS_PS2ReleaseWads();
+#endif
 
 	if( loaded ) *loaded = true;	// all done
 }

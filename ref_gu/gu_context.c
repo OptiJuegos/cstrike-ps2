@@ -106,6 +106,17 @@ void Mod_BrushUnloadTextures( model_t *mod )
 		GL_FreeTexture( tx->gl_texturenum );    // main texture
 		GL_FreeTexture( tx->fb_texturenum );    // luma texture
 	}
+
+#if XASH_PS2
+	// the sky and light maps would wait for the next map, pinning the arena
+	if( FBitSet( mod->flags, MODEL_WORLD ))
+	{
+		R_UnloadSkybox();
+		for( i = 0; i < MAX_LIGHTMAPS && tr.lightmapTextures[i]; i++ )
+			GL_FreeTexture( tr.lightmapTextures[i] );
+		memset( tr.lightmapTextures, 0, sizeof( tr.lightmapTextures ));
+	}
+#endif
 }
 
 void Mod_UnloadTextures( model_t *mod )

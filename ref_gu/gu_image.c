@@ -17,6 +17,9 @@ GNU General Public License for more details.
 #include <pspsuspend.h>
 #include "gu_local.h"
 #include "crclib.h"
+#if XASH_PS2
+#include "arena_ps2.h"
+#endif
 
 #define TEXTURES_HASH_SIZE	(MAX_TEXTURES >> 2)
 
@@ -228,6 +231,9 @@ static int GL_CalcMipmapCount( gl_texture_t *tex, qboolean haveBuffer, size_t *m
 
 	Assert( tex != NULL );
 
+#if XASH_PS2
+	return 1; // shortcut: no mipmaps saves RAM but textures shimmer far away; add MIPTBP to upgrade
+#endif
 	if( !haveBuffer )
 		return 1;
 
@@ -264,7 +270,12 @@ GL_SetTextureDimensions
 */
 static void GL_SetTextureDimensions( gl_texture_t *tex, int width, int height )
 {
+#if XASH_PS2
+	// fonts and menus need every texel, the world fits the RAM at half size
+	int		maxTextureSize = FBitSet( tex->flags, TF_NOMIPMAP ) ? 256 : glConfig.max_texture_size;
+#else
 	int		maxTextureSize = glConfig.max_texture_size;
+#endif
 	int		step = (int)gl_round_down->value;
 	int		scaled_width, scaled_height;
 
@@ -314,6 +325,8 @@ HUD, menu art, fonts, lightmaps and decals keep full size. Only formats the
 uploader can resample qualify.
 ================
 */
+#define PS2_TEXTURE_FULL_SIZE_FREE ( 1024 * 1024 )
+
 static void GL_ShrinkTextureDimensions( gl_texture_t *tex, const rgbdata_t *pic )
 {
 	static const char *const from64[] = { "#sprites/", "#models/player/" };
@@ -321,6 +334,19 @@ static void GL_ShrinkTextureDimensions( gl_texture_t *tex, const rgbdata_t *pic 
 	// tiles are placed by their uploaded size, halving them broke the menu
 	static const char *const from128[] = { "#models/", "#maps/", "sprites/", "gfx/env/" };
 	int i, minSize = 0;
+
+#if XASH_PS2
+	// Effect sprites always shrink: they move and blend, and the memory they
+	// would take from a light map is the margin a heavy one needs to load.
+	// the sniper scope arc lives outside the arena: 256x256 RGBA costs 128 KB of heap
+	if( Q_strncmp( tex->name, "#sprites/", 9 ) && Q_strncmp( tex->name, "sprites/scope_arc", 17 ))
+	{
+		// Full size while the arena allows it: a big map must still fit its
+		// models after the textures.
+		if( PS2_Arena_LargestFree() >= PS2_TEXTURE_FULL_SIZE_FREE )
+			return;
+	}
+#endif
 
 	if( !ImageIND( pic->type ) && pic->type != PF_RGBA_32 && pic->type != PF_BGRA_32 )
 		return;
@@ -873,7 +899,11 @@ static qboolean	gl_temp_in_heap;
 
 static byte *GL_TempAlloc( size_t size )
 {
+#if XASH_PS2
+	byte	*buf = PS2_Arena_Alloc( size );
+#else
 	byte	*buf = gEngfuncs.P5Ram_Alloc( size, 0 );
+#endif
 
 	gl_temp_in_heap = false;
 
@@ -890,9 +920,153 @@ static byte *GL_TempAlloc( size_t size )
 
 static void GL_TempFree( byte *buf )
 {
+#if XASH_PS2
+	PS2_Free( buf );
+#else
 	if( gl_temp_in_heap ) free( buf );
 	else gEngfuncs.P5Ram_Free( buf );
+#endif
 }
+
+#if XASH_PS2
+/*
+===============
+GL_PS2ReleasePalette
+
+Textures with the same colors share a palette: it goes with its last user.
+===============
+*/
+static void GL_PS2ReleasePalette( gl_texture_t *tex )
+{
+	byte	*palette = tex->dstPalette;
+	uint	i;
+
+	tex->dstPalette = NULL;
+	if( !palette || palette == gl_palette_332 )
+		return;
+
+	for( i = 0; i < gl_numTextures; i++ )
+		if( gl_textures[i].dstPalette == palette )
+			return;
+
+	if( vchkptr( palette ))
+		vfree( palette );
+	else free( palette );
+}
+
+/*
+===============
+GL_PS2SetPalette
+
+Every sprite frame has its own copy of the sprite's palette, 1 KB per frame.
+===============
+*/
+static void GL_PS2SetPalette( gl_texture_t *tex, const rgbdata_t *pic )
+{
+	byte	converted[PALETTE_SIZE];
+	uint	i;
+
+	GL_PixelConverter( converted, pic->palette, 256, PC_SWF( pic->type ), PC_HWF( PALETTE_FORMAT ));
+	GL_PS2ReleasePalette( tex );
+
+	for( i = 0; i < gl_numTextures; i++ )
+	{
+		byte	*other = gl_textures[i].dstPalette;
+
+		if( other && other != gl_palette_332 && !memcmp( other, converted, PALETTE_SIZE ))
+		{
+			tex->dstPalette = other;
+			return;
+		}
+	}
+
+	tex->dstPalette = ( byte* )valloc( PALETTE_SIZE );
+	if( !tex->dstPalette )
+	{
+		tex->dstPalette = ( byte* )memalign( 16, PALETTE_SIZE );
+		if( !tex->dstPalette )
+			gEngfuncs.Host_Error( "GL_UploadTexture: %s out of memory for palette ( %lu )\n", tex->name, PALETTE_SIZE );
+	}
+	memcpy( tex->dstPalette, converted, PALETTE_SIZE );
+	sceKernelDcacheWritebackRange( tex->dstPalette, PALETTE_SIZE );
+}
+
+/*
+===============
+GL_PS2ReleasePixels
+
+Sprite frames with the same pixels share them: they go with their last user.
+===============
+*/
+static void GL_PS2ReleasePixels( gl_texture_t *tex )
+{
+	byte	*pixels = tex->dstTexture;
+	uint	i;
+
+	tex->dstTexture = NULL;
+	if( !pixels )
+		return;
+
+	for( i = 0; i < gl_numTextures; i++ )
+		if( gl_textures[i].dstTexture == pixels )
+			return;
+
+	PS2_Free( pixels );
+}
+
+/*
+===============
+GL_PS2AllocPixels
+
+Textures that die with the level go to the arena (arena_ps2.c).
+===============
+*/
+static byte *GL_PS2AllocPixels( const gl_texture_t *tex, size_t size )
+{
+	byte	*pixels = NULL;
+
+	if( !Q_strncmp( tex->name, "#models/", 8 ) || !Q_strncmp( tex->name, "#maps/", 6 ) || !Q_strncmp( tex->name, "#sprites/", 9 )
+		|| !Q_strncmp( tex->name, "gfx/env/", 8 ) || !Q_strncmp( tex->name, "*lightmap", 9 )
+		|| ( Q_strstr( tex->name, ".wad/" ) && Q_strncmp( tex->name, "decals.wad/", 11 )))
+		pixels = PS2_Arena_Alloc( size );
+
+	return pixels ? pixels : ( byte* )valloc( size );
+}
+
+static qboolean GL_PS2IsSpritePixels( const gl_texture_t *tex )
+{
+	// nothing uploads over these after loading, unlike lightmaps or player skins
+	return !Q_strncmp( tex->name, "#sprites/", 9 ) || !Q_strncmp( tex->name, "#HUD/", 5 );
+}
+
+static void GL_PS2SharePixels( gl_texture_t *tex, size_t size )
+{
+	uint	i;
+
+	if( !GL_PS2IsSpritePixels( tex ))
+		return;
+
+	for( i = 0; i < gl_numTextures; i++ )
+	{
+		const gl_texture_t	*other = &gl_textures[i];
+
+		if( other == tex || !other->dstTexture || other->dstTexture == tex->dstTexture
+			|| other->format != tex->format || other->width != tex->width || other->height != tex->height
+			|| !GL_PS2IsSpritePixels( other ) || memcmp( other->dstTexture, tex->dstTexture, size ))
+			continue;
+
+		// the HUD outlives the level: borrowing level pixels would pin the arena
+		if( PS2_Arena_Contains( other->dstTexture ) && !PS2_Arena_Contains( tex->dstTexture ))
+			continue;
+
+		GL_PS2ReleasePixels( tex );
+		tex->dstTexture = other->dstTexture;
+		ClearBits( tex->flags, TF_IMG_INVRAM );
+		SetBits( tex->flags, FBitSet( other->flags, TF_IMG_INVRAM ));
+		return;
+	}
+}
+#endif
 
 /*
 ===============
@@ -941,16 +1115,24 @@ static qboolean GL_UploadTexture( gl_texture_t *tex, rgbdata_t *pic )
 	texSize = GL_CalcTextureSize( tex->format, tex->width, tex->height, &tex->bpp );
 	normalMap = FBitSet( tex->flags, TF_NORMALMAP ) ? true : false;
 	tex->numMips = ImageIND( pic->type ) ? GL_CalcMipmapCount( tex, ( pic->buffer != NULL ), &texSize ) : 1;
+#if XASH_PS2
+	swizzle = false; // the GS has its own memory layout
+#else
 	swizzle = IsLightMap( tex ) ? false : true;
+#endif
 	mipOffset = 0;
 
 	// Check allocation size
 	if( tex->dstTexture && ( tex->size != texSize ) )
 	{
+#if XASH_PS2
+		GL_PS2ReleasePixels( tex );
+#else
 		if( FBitSet( tex->flags, TF_IMG_INVRAM ) )
 			vfree( tex->dstTexture );
 		else
 			free( tex->dstTexture );
+#endif
 
 		tex->dstTexture = NULL;
 		ClearBits( tex->flags, TF_IMG_INVRAM );
@@ -959,7 +1141,11 @@ static qboolean GL_UploadTexture( gl_texture_t *tex, rgbdata_t *pic )
 	// already allocated?
 	if( !tex->dstTexture )
 	{
+#if XASH_PS2
+		tex->dstTexture = GL_PS2AllocPixels( tex, texSize );
+#else
 		tex->dstTexture = ( byte* )valloc( texSize );
+#endif
 		if( !tex->dstTexture )
 		{
 			tex->dstTexture = ( byte* )memalign( 16, texSize );
@@ -977,6 +1163,9 @@ static qboolean GL_UploadTexture( gl_texture_t *tex, rgbdata_t *pic )
 	{
 		if( pic->type != PF_RGB_332 )
 		{
+#if XASH_PS2
+			GL_PS2SetPalette( tex, pic );
+#else
 			if( !tex->dstPalette )
 			{
 				tex->dstPalette = ( byte* )valloc( PALETTE_SIZE );
@@ -991,6 +1180,7 @@ static qboolean GL_UploadTexture( gl_texture_t *tex, rgbdata_t *pic )
 			// Load palette
 			GL_PixelConverter( tex->dstPalette, pic->palette, 256, PC_SWF( pic->type ), PC_HWF( PALETTE_FORMAT ));
 			sceKernelDcacheWritebackRange( tex->dstPalette, PALETTE_SIZE );
+#endif
 		}
 		else tex->dstPalette = gl_palette_332;
 
@@ -1017,6 +1207,9 @@ static qboolean GL_UploadTexture( gl_texture_t *tex, rgbdata_t *pic )
 			GL_TempFree( tempBuff );
 			SetBits( tex->flags, TF_IMG_SWIZZLED );
 		}
+#if XASH_PS2
+		GL_PS2SharePixels( tex, texSize );
+#endif
 	}
 	else if( pic->type == PF_RGB_5650 || pic->type == PF_RGBA_5551 || pic->type == PF_RGBA_4444 )
 	{
@@ -1045,7 +1238,7 @@ static qboolean GL_UploadTexture( gl_texture_t *tex, rgbdata_t *pic )
 		if(( pic->width != tex->width ) || ( pic->height != tex->height ))
 			offset = tex->width * tex->height * 4; // src size
 
-		tempBuff = GL_TempAlloc( swizzle ? ( texSize + offset ) : texSize );
+		tempBuff = GL_TempAlloc( swizzle ? ( texSize + offset ) : Q_max( texSize, offset ));
 
 		if(( pic->width != tex->width ) || ( pic->height != tex->height ))
 			GL_ResampleTexture32( pic->buffer, pic->width, pic->height, tempBuff, tex->width, tex->height, normalMap );
@@ -1336,13 +1529,20 @@ static void GL_DeleteTexture( gl_texture_t *tex )
 	if( tex->original )
 		gEngfuncs.FS_FreeImage( tex->original );
 
+#if XASH_PS2
+	GL_PS2ReleasePalette( tex );
+#else
 	if( tex->dstPalette && tex->dstPalette != gl_palette_332 )
 	{
 		if( vchkptr( tex->dstPalette ))
 			vfree( tex->dstPalette );
 		else free( tex->dstPalette );
 	}
+#endif
 
+#if XASH_PS2
+	GL_PS2ReleasePixels( tex );
+#else
 	if( tex->dstTexture )
 	{
 		if( FBitSet( tex->flags, TF_IMG_INVRAM ) )
@@ -1350,6 +1550,7 @@ static void GL_DeleteTexture( gl_texture_t *tex )
 		else
 			free( tex->dstTexture );
 	}
+#endif
 	memset( tex, 0, sizeof( *tex ));
 }
 
@@ -1418,11 +1619,23 @@ int GL_LoadTexture( const char *name, const byte *buf, size_t size, int flags )
 	gEngfuncs.Image_SetForceFlags( picFlags );
 
 	pic = gEngfuncs.FS_LoadImage( name, buf, size );
+#if XASH_PS2
+	{
+		extern int ps2_gs_trace;
+		if( ps2_gs_trace ) printf( "[XASH-PS2] TEX image=%p %dx%d type=%d\n", pic, pic ? pic->width : 0, pic ? pic->height : 0, pic ? pic->type : 0 );
+	}
+#endif
 	if( !pic ) return 0; // couldn't loading image
 
 	// allocate the new one
 	tex = GL_AllocTexture( name, flags );
 	GL_ProcessImage( tex, pic );
+#if XASH_PS2
+	{
+		extern int ps2_gs_trace;
+		if( ps2_gs_trace ) printf( "[XASH-PS2] TEX processed, uploading\n" );
+	}
+#endif
 
 	if( !GL_UploadTexture( tex, pic ))
 	{
@@ -1989,6 +2202,61 @@ static void GL_Create332Palette( void )
 	sceKernelDcacheWritebackRange( gl_palette_332, PALETTE_SIZE );
 }
 
+
+#if XASH_PS2
+/*
+===============
+GL_PS2PrintTextureUse
+
+Textures live outside the zone pools, so the heap report counts them here.
+===============
+*/
+void GL_PS2PrintTextureUse( void )
+{
+	static const char *const groups[] = { "#models/player/", "#models/", "#maps/", "#sprites/", "sprites/", "#HUD/", "gfx/", "resource/", "*", "" };
+	size_t bytes[10] = { 0 }, total = 0;
+	uint counts[10] = { 0 }, palettes = 0, dup_palettes = 0;
+	const gl_texture_t *tex;
+	uint i, g;
+
+	for( i = 0, tex = gl_textures; i < gl_numTextures; i++, tex++ )
+	{
+		uint	first;
+
+		if( !tex->dstTexture )
+			continue;
+		for( g = 0; Q_strncmp( tex->name, groups[g], Q_strlen( groups[g] )); g++ );
+		for( first = 0; first < i && gl_textures[first].dstTexture != tex->dstTexture; first++ );
+		counts[g]++;
+		if( first == i ) // shared pixels count once
+		{
+			bytes[g] += tex->size;
+			total += tex->size;
+		}
+		if( tex->dstPalette && tex->dstPalette != gl_palette_332 )
+		{
+			uint j;
+
+			for( j = 0; j < i && gl_textures[j].dstPalette != tex->dstPalette; j++ );
+			if( j == i ) // shared palettes count once
+			{
+				palettes++;
+				// same colors in another allocation: what deduplication would save
+				for( j = 0; j < i && !( gl_textures[j].dstPalette && gl_textures[j].dstPalette != tex->dstPalette
+					&& gl_textures[j].dstPalette != gl_palette_332 && !memcmp( gl_textures[j].dstPalette, tex->dstPalette, PALETTE_SIZE )); j++ );
+				if( j < i ) dup_palettes++;
+			}
+		}
+		if( first == i && tex->size >= 16 * 1024 && !PS2_Arena_Contains( tex->dstTexture ))
+			printf( "[XASH-PS2] TEX_HEAP bytes=%u name=%s\n", (unsigned)tex->size, tex->name );
+	}
+	printf( "[XASH-PS2] TEX_PALETTE_DUPLICATES %u\n", dup_palettes );
+	for( g = 0; g < 10; g++ )
+		printf( "[XASH-PS2] TEX_GROUP bytes=%u count=%u prefix=%s\n", (unsigned)bytes[g], counts[g], groups[g] );
+	printf( "[XASH-PS2] TEX_TOTAL pixels=%u palettes=%u palette_bytes=%u\n",
+		(unsigned)total, palettes, palettes * (unsigned)( PALETTE_SIZE ));
+}
+#endif
 
 /*
 ===============

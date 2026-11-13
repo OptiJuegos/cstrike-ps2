@@ -1224,6 +1224,17 @@ qboolean Image_AddIndexedImageToPack( const byte *in, int width, int height )
 	else Image_CopyPalette32bit(); 
 
 	// reallocate image buffer
+#if XASH_PS2
+	if( !expand_to_rgba && image.borrow_source )
+	{
+		// Inline indexed Studio/sprite image: ref_soft converts this to CT16
+		// synchronously, so no ImageLib-owned 256 KB copy is required.
+		// FS_FreeImage sees IMAGE_BORROWED_PIXELS and frees only the palette.
+		image.rgba = (byte *)in;
+		image.flags |= IMAGE_BORROWED_PIXELS;
+		return true;
+	}
+#endif
 	image.rgba = Mem_Malloc( host.imagepool, image.size );	
 	if( !expand_to_rgba ) memcpy( image.rgba, in, image.size );
 	else if( !Image_Copy8bitRGBA( in, image.rgba, mipsize ))
@@ -1497,6 +1508,18 @@ qboolean Image_Process( rgbdata_t **pix, int width, int height, uint flags, floa
 		image.force_flags = 0;
 		return false; // no operation specfied
 	}
+
+#if XASH_PS2
+	// Image_Process operations can mutate/resize the source. Materialize a
+	// private copy only when an actual processing operation requires it.
+	if( FBitSet( pic->flags, IMAGE_BORROWED_PIXELS ))
+	{
+		byte *owned = Mem_Malloc( host.imagepool, pic->size );
+		memcpy( owned, pic->buffer, pic->size );
+		pic->buffer = owned;
+		ClearBits( pic->flags, IMAGE_BORROWED_PIXELS );
+	}
+#endif
 
 	if( FBitSet( flags, IMAGE_MAKE_LUMA ))
 	{

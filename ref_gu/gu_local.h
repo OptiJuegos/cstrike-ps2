@@ -67,7 +67,11 @@ GNU General Public License for more details.
 
 extern byte	*r_temppool;
 
+#if XASH_PS2
+#define LIGHTMAP_BPP	1 // indexed: gs_gu.c turns the palette into a light value in alpha
+#else
 #define LIGHTMAP_BPP	2 //1 2 3 4
+#endif
 
 #if LIGHTMAP_BPP == 1
 #define LIGHTMAP_FORMAT	PF_RGB_332
@@ -141,7 +145,11 @@ extern byte	*r_temppool;
 typedef struct gltexture_s
 {
 
+#if XASH_PS2
+	char		name[64];	// the longest on de_dust2 is 51 characters; GL_CheckTexName refuses longer ones
+#else
 	char		name[128];	// game path, including extension (can be store image programs)
+#endif
 	short		srcWidth;		// keep unscaled sizes
 	short		srcHeight;
 	short		width;		// upload width\height
@@ -233,6 +241,9 @@ typedef struct
 	qboolean		isSkyVisible;	// sky is visible
 	qboolean		onlyClientDraw;	// disabled by client request
 	qboolean		drawOrtho;	// draw world as orthogonal projection	
+#if XASH_PS2
+	qboolean		drawCubemap;
+#endif
 
 	float		fov_x, fov_y;	// current view fov
 
@@ -398,7 +409,11 @@ typedef struct
 extern ref_perf_t r_perf;
 
 // seconds, for the r_perf timers
+#if XASH_PS2
+#define R_PerfTime()	0.0 // ps2_perf.h times the frame; 64-bit soft doubles cost more than they tell
+#else
 #define R_PerfTime()	( sceKernelGetSystemTimeWide() * 0.000001 )
+#endif
 
 void GL_CleanUpTextureUnits( int last );
 void GL_Bind( GLint tmu, GLenum texnum );
@@ -608,6 +623,7 @@ void R_AliasInit( void );
 void R_InitSkyClouds( mip_t *mt, struct texture_s *tx, qboolean custom_palette );
 void R_AddSkyBoxSurface( msurface_t *fa );
 void R_ClearSkyBox( void );
+void R_UnloadSkybox( void );
 void R_DrawSkyBox( void );
 void R_DrawClouds( void );
 void EmitWaterPolys( msurface_t *warp, qboolean reverse );
@@ -816,6 +832,9 @@ extern cvar_t	*r_drawentities;
 extern cvar_t	*r_decals;
 extern cvar_t	*r_novis;
 extern cvar_t	*r_nocull;
+#if XASH_PS2
+extern cvar_t	*r_split_pvs;
+#endif
 extern cvar_t	*r_lockpvs;
 extern cvar_t	*r_lockfrustum;
 extern cvar_t	*r_traceglow;

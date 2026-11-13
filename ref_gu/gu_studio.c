@@ -22,6 +22,7 @@ GNU General Public License for more details.
 #include "studio.h"
 #include "pm_local.h"
 #include "cl_tent.h"
+#include "ps2_studio_perf.h"
 //#include "client.h"
 #include "pmtrace.h"
 
@@ -138,9 +139,21 @@ static cvar_t		*r_drawviewmodel;
 cvar_t				*cl_righthand = NULL;
 static cvar_t		*cl_himodels;
 static cvar_t		*r_studio_drawelements;
+static cvar_t		*r_studio_lod_dist;
 
 static r_studio_interface_t	*pStudioDraw;
+#if XASH_PS2
+static uint		g_studio_rgb[MAXSTUDIOVERTS];
+#endif
+#if XASH_PS2
+// VU0 (common/ps2_vu0.h) loads the bone matrices a row at a time: rows must be 16-byte aligned
+static studio_draw_state_t	g_studio __attribute__(( aligned( 16 )));
+typedef char studio_bones_aligned_t[( offsetof( studio_draw_state_t, rotationmatrix ) & 15 ) == 0
+	&& ( offsetof( studio_draw_state_t, bonestransform ) & 15 ) == 0
+	&& ( offsetof( studio_draw_state_t, lighttransform ) & 15 ) == 0 ? 1 : -1];
+#else
 static studio_draw_state_t	g_studio;		// global studio state
+#endif
 
 // global variables
 static qboolean		m_fDoRemap;
@@ -165,6 +178,7 @@ void R_StudioInit( void )
 	r_studio_sort_textures = gEngfuncs.Cvar_Get( "r_studio_sort_textures", "0", FCVAR_ARCHIVE, "change draw order for additive meshes" );
 	r_drawviewmodel = gEngfuncs.Cvar_Get( "r_drawviewmodel", "1", 0, "draw firstperson weapon model" );
 	r_studio_drawelements = gEngfuncs.Cvar_Get( "r_studio_drawelements", "0", FCVAR_ARCHIVE, "use glDrawElements for studiomodels" );
+	r_studio_lod_dist = gEngfuncs.Cvar_Get( "r_studio_lod_dist", "0", FCVAR_ARCHIVE, "models farther than this from the view get flat light and simpler animation (0 = off)" );
 
 	Matrix3x4_LoadIdentity( g_studio.rotationmatrix );
 	r_glowshellfreq = gEngfuncs.Cvar_Get( "r_glowshellfreq", "2.2", 0, "glowing shell frequency update" );
@@ -1367,6 +1381,39 @@ R_StudioDynamicLight
 
 ===============
 */
+#if XASH_PS2
+// Up to 2 sky traces and 5 world traces per model. The light under a model hardly changes
+// over a few frames, so they run again only after it moved or some time passed.
+// A dynamic light is not cached: it is added after this. Slots go by pointer, because
+// temporary entities such as shells have no index of their own. Two slots per pointer:
+// with one, two models on the same slot evicted each other on every call.
+#define STUDIO_LIGHT_CACHE_BITS	7
+#define STUDIO_LIGHT_CACHE_MOVE	32.0f
+#define STUDIO_LIGHT_CACHE_TIME	0.5f
+
+typedef struct
+{
+	const cl_entity_t	*ent;
+	vec3_t		origin, lightDir, lightspot, lightvec;
+	colorVec		light;
+	float		time;
+	int		effects;
+} studio_light_cache_t;
+
+static studio_light_cache_t	g_studio_light_cache[1 << STUDIO_LIGHT_CACHE_BITS];
+#endif
+
+// r_studio_lod_dist: far models keep their light longer and get one flat color
+static qboolean R_StudioIsFar( const cl_entity_t *ent )
+{
+	vec3_t	d;
+	float	lod = r_studio_lod_dist->value;
+
+	if( lod <= 0.0f || !ent ) return false;
+	VectorSubtract( ent->origin, RI.vieworg, d );
+	return DotProduct( d, d ) > lod * lod;
+}
+
 void R_StudioDynamicLight( cl_entity_t *ent, alight_t *plight )
 {
 	movevars_t	*mv = gEngfuncs.pfnGetMoveVars();
@@ -1376,6 +1423,11 @@ void R_StudioDynamicLight( cl_entity_t *ent, alight_t *plight )
 	colorVec		light;
 	uint		lnum;
 	dlight_t		*dl;
+	const float	time = g_studio.time; // the double compare runs in software on the EE
+#if XASH_PS2
+	studio_light_cache_t	*cache;
+	qboolean		isFar;
+#endif
 
 	if( !plight || !ent || !ent->model )
 		return;
@@ -1397,6 +1449,30 @@ void R_StudioDynamicLight( cl_entity_t *ent, alight_t *plight )
 
 	VectorCopy( ent->origin, origin );
 
+#if XASH_PS2
+	PS2_STUDIO_ADD( LIGHTCALLS, 1 );
+	cache = &g_studio_light_cache[( (uint)ent * 2654435761u ) >> ( 32 - STUDIO_LIGHT_CACHE_BITS ) & ~1u];
+	if( cache->ent != ent && ( cache[1].ent == ent || cache[1].time < cache->time ))
+		cache++; // the slot holding this model, else the older one
+	VectorSubtract( origin, cache->origin, dist );
+
+	// the time goes back on a new map; far models keep the light 4x the move and 2.5x the time
+	isFar = R_StudioIsFar( ent );
+	if( cache->ent == ent && cache->effects == ( ent->curstate.effects & EF_INVLIGHT )
+		&& time >= cache->time && time - cache->time < ( isFar ? STUDIO_LIGHT_CACHE_TIME * 2.5f : STUDIO_LIGHT_CACHE_TIME )
+		&& DotProduct( dist, dist ) < ( isFar ? 16.0f : 1.0f ) * STUDIO_LIGHT_CACHE_MOVE * STUDIO_LIGHT_CACHE_MOVE )
+	{
+		VectorCopy( cache->lightDir, lightDir );
+		VectorCopy( cache->lightspot, g_studio.lightspot );
+		VectorCopy( cache->lightvec, g_studio.lightvec );
+		light = cache->light;
+		goto cached;
+	}
+#endif
+
+#if XASH_PS2
+	PS2_STUDIO_ADD( LIGHTMISSES, 1 );
+#endif
 	VectorSet( vecSrc, origin[0], origin[1], origin[2] - lightDir[2] * 8.0f );
 	light.r = light.g = light.b = light.a = 0;
 
@@ -1480,6 +1556,17 @@ void R_StudioDynamicLight( cl_entity_t *ent, alight_t *plight )
 		}
 	}
 
+#if XASH_PS2
+	cache->ent = ent;
+	cache->effects = ent->curstate.effects & EF_INVLIGHT;
+	cache->time = time;
+	cache->light = light;
+	VectorCopy( origin, cache->origin );
+	VectorCopy( lightDir, cache->lightDir );
+	VectorCopy( g_studio.lightspot, cache->lightspot );
+	VectorCopy( g_studio.lightvec, cache->lightvec );
+cached:
+#endif
 	VectorSet( finalLight, light.r, light.g, light.b );
 	ent->cvFloorColor = light;
 
@@ -1489,9 +1576,9 @@ void R_StudioDynamicLight( cl_entity_t *ent, alight_t *plight )
 	// scale lightdir by light intentsity
 	VectorScale( lightDir, total, lightDir );
 
-	for( lnum = 0, dl = gEngfuncs.GetDynamicLight( 0 ); lnum < MAX_DLIGHTS; lnum++, dl++ )
+	for( lnum = 0, dl = gEngfuncs.GetDynamicLight( 0 ); r_dynamic->value && lnum < MAX_DLIGHTS; lnum++, dl++ )
 	{
-		if( dl->die < g_studio.time || !r_dynamic->value )
+		if( dl->die < time )
 			continue;
 
 		VectorSubtract( ent->origin, dl->origin, dist );
@@ -1557,10 +1644,11 @@ void R_StudioEntityLight( alight_t *lightinfo )
 	cl_entity_t	*ent = RI.currententity;
 	vec3_t		mid, origin, pos;
 	dlight_t		*el;
+	const float	time = g_studio.time; // the double compare runs in software on the EE
 
 	g_studio.numlocallights = 0;
 
-	if( !ent || !r_dynamic->value )
+	if( !ent || !r_dynamic->value || R_StudioIsFar( ent ))
 		return;
 
 	for( i = 0; i < MAX_LOCALLIGHTS; i++ )
@@ -1572,7 +1660,7 @@ void R_StudioEntityLight( alight_t *lightinfo )
 
 	for( lnum = 0, el = gEngfuncs.GetEntityLight( 0 ); lnum < MAX_ELIGHTS; lnum++, el++ )
 	{
-		if( el->die < g_studio.time || el->radius <= 0.0f )
+		if( el->die < time || el->radius <= 0.0f )
 			continue;
 
 		if(( el->key & 0xFFF ) == ent->index )
@@ -1640,6 +1728,8 @@ void R_StudioSetupLighting( alight_t *plight )
 	if( RI.currententity != NULL )
 		scale = RI.currententity->curstate.scale;
 
+	PS2_STUDIO_BEGIN( SETUP );
+
 	g_studio.ambientlight = plight->ambientlight;
 	g_studio.shadelight = plight->shadelight;
 	VectorCopy( plight->plightvec, g_studio.lightvec );
@@ -1651,6 +1741,8 @@ void R_StudioSetupLighting( alight_t *plight )
 	}
 
 	VectorCopy( plight->color, g_studio.lightcolor );
+
+	PS2_STUDIO_END( SETUP );
 }
 
 /*
@@ -1709,6 +1801,48 @@ _inline void R_StudioLighting( float *lv, int bone, int flags, vec3_t normal )
 	*lv = illum * ( 1.0f / 255.0f );
 }
 
+#if XASH_PS2
+/* No local lights or chrome: keep float light values for fallback paths and
+ * pack GS colors while their components are still live, without a second pass. */
+static void R_StudioLightNormalsPS2( int first, int count, const byte *bones, const vec3_t *normals, int flags, qboolean weighted )
+{
+	int i;
+	if( count <= 0 ) return;
+	if( FBitSet( flags, STUDIO_NF_FULLBRIGHT|STUDIO_NF_FLATSHADE ))
+	{
+		float lv, r, g, b;
+		uint rgb;
+		R_StudioLighting( &lv, -1, flags, g_studio.lightvec );
+		r = g_studio.lightcolor[0] * lv;
+		g = g_studio.lightcolor[1] * lv;
+		b = g_studio.lightcolor[2] * lv;
+		rgb = (uint)(byte)( r * 255 ) | (uint)(byte)( g * 255 ) << 8 | (uint)(byte)( b * 255 ) << 16;
+		for( i = first; i < first + count; i++ )
+		{
+			g_studio.lightvalues[i][0] = r;
+			g_studio.lightvalues[i][1] = g;
+			g_studio.lightvalues[i][2] = b;
+			g_studio_rgb[i] = rgb;
+		}
+		return;
+	}
+	for( i = 0; i < count; i++ )
+	{
+		const int k = first + i;
+		float lv, r, g, b;
+		// Only FULLBRIGHT and FLATSHADE affect this function; handled above.
+		R_StudioLighting( &lv, weighted ? -1 : bones[i], 0,
+			weighted ? g_studio.norms[k] : (float *)normals[i] );
+		r = g_studio.lightcolor[0] * lv;
+		g = g_studio.lightcolor[1] * lv;
+		b = g_studio.lightcolor[2] * lv;
+		g_studio.lightvalues[k][0] = r;
+		g_studio.lightvalues[k][1] = g;
+		g_studio.lightvalues[k][2] = b;
+		g_studio_rgb[k] = (uint)(byte)( r * 255 ) | (uint)(byte)( g * 255 ) << 8 | (uint)(byte)( b * 255 ) << 16;
+	}
+}
+#endif
 /*
 ====================
 R_LightLambert
@@ -2167,6 +2301,12 @@ _inline void R_StudioDrawNormalMesh( short *ptricmds, vec3_t *pstudionorms, floa
 {
 	float	*lv;
 	int		i, prim, index;
+#if XASH_PS2
+	const qboolean baked = !g_studio.numlocallights && RI.currententity->curstate.rendermode != kRenderTransColor;
+	const uint alpha = (uint)(byte)( tr.blend * 255 ) << 24;
+	if( baked && !g_studioclip.active && ps2_gu_studio_mesh( ptricmds, (const float (*)[3])g_studio.verts, s, t, g_studio_rgb, alpha ))
+		return;
+#endif
 
 	while(( i = *( ptricmds++ )))
 	{
@@ -2179,16 +2319,32 @@ _inline void R_StudioDrawNormalMesh( short *ptricmds, vec3_t *pstudionorms, floa
 		{			
 			prim = GU_TRIANGLE_STRIP;
 		}
-		
-		gu_vert_ftcv_t* const out = ( gu_vert_ftcv_t* )sceGuGetMemory( sizeof( gu_vert_ftcv_t ) * i );		
+
+#if XASH_PS2
+		PS2_STUDIO_ADD( STRIPS, 1 );
+		PS2_STUDIO_ADD( STRIPVERTS, i );
+		if( baked && !g_studioclip.active && ps2_gu_studio_prim( prim, ptricmds, i, (const float (*)[3])g_studio.verts, s, t, g_studio_rgb, alpha ))
+		{
+			ptricmds += i * 4;
+			continue;
+		}
+#endif
+
+		gu_vert_ftcv_t* const out = ( gu_vert_ftcv_t* )sceGuGetMemory( sizeof( gu_vert_ftcv_t ) * i );
 
 		for( index = 0; index < i; index++, ptricmds += 4 )
 		{
-			byte color[4];
-			R_StudioSetColorArray( ptricmds, pstudionorms, color );	
+#if XASH_PS2
+			if( baked ) out[index].c = g_studio_rgb[ptricmds[1]] | alpha;
+			else
+#endif
+			{
+				byte color[4];
+				R_StudioSetColorArray( ptricmds, pstudionorms, color );
+				out[index].c = GUCOLOR4UBV( color );
+			}
 			out[index].u = ptricmds[2] * s;
 			out[index].v = ptricmds[3] * t;
-			out[index].c = GUCOLOR4UBV( color );
 			out[index].x = g_studio.verts[ptricmds[0]][0];
 			out[index].y = g_studio.verts[ptricmds[0]][1];
 			out[index].z = g_studio.verts[ptricmds[0]][2];
@@ -2253,6 +2409,13 @@ _inline void R_StudioDrawChromeMesh( short *ptricmds, vec3_t *pstudionorms, floa
 	vec3_t		vert;
 	byte 		color[4];
 
+#if XASH_PS2
+	if( !glowShell && !g_studio.numlocallights && !g_studioclip.active
+		&& RI.currententity->curstate.rendermode != kRenderTransColor
+		&& ps2_gu_studio_chrome_mesh( ptricmds, (const float (*)[3])g_studio.verts,
+			(const float (*)[2])g_studio.chrome, s, t, g_studio_rgb, (uint)(byte)( tr.blend * 255 ) << 24 ))
+		return;
+#endif
 	while(( i = *( ptricmds++ )))
 	{
 		if( i < 0 )
@@ -2591,6 +2754,31 @@ R_StudioDrawPoints
 
 ===============
 */
+#if XASH_PS2
+/* Rigid skinning with no local lights: inline the scalar matrix operation
+ * for the whole submodel and avoid per-vertex calls and empty light work. */
+static void R_StudioTransformVertsPS2( const byte *bones, const vec3_t *verts, int count )
+{
+	int i, lastbone = -1;
+	float m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23;
+	for( i = 0; i < count; i++ )
+	{
+		const float *v = verts[i];
+		float *out = g_studio.verts[i];
+		if( bones[i] != lastbone )
+		{
+			const float (*matrix)[4] = g_studio.bonestransform[bones[i]];
+			m00 = matrix[0][0]; m01 = matrix[0][1]; m02 = matrix[0][2]; m03 = matrix[0][3];
+			m10 = matrix[1][0]; m11 = matrix[1][1]; m12 = matrix[1][2]; m13 = matrix[1][3];
+			m20 = matrix[2][0]; m21 = matrix[2][1]; m22 = matrix[2][2]; m23 = matrix[2][3];
+			lastbone = bones[i];
+		}
+		out[0] = v[0] * m00 + v[1] * m01 + v[2] * m02 + m03;
+		out[1] = v[0] * m10 + v[1] * m11 + v[2] * m12 + m13;
+		out[2] = v[0] * m20 + v[1] * m21 + v[2] * m22 + m23;
+	}
+}
+#endif
 static void R_StudioDrawPointsInternal( void );
 static qboolean r_perf_viewmodel;	// inside R_DrawViewModel: counted there
 
@@ -2616,8 +2804,15 @@ static void R_StudioDrawPointsInternal( void )
 	mstudiomesh_t	*pmesh;
 	short		*pskinref;
 	float		lv_tmp;
+#if XASH_PS2
+	int		lodflags;
+#endif
 
 	if( !m_pStudioHeader ) return;
+#if XASH_PS2
+	// the view model is at the view origin, so it is never far
+	lodflags = R_StudioIsFar( RI.currententity ) ? STUDIO_NF_FLATSHADE : 0;
+#endif
 
 #ifdef STUDIO_DRAWELEMENTS
 	g_studio.numverts = g_studio.numelems = 0;
@@ -2635,6 +2830,11 @@ static void R_StudioDrawPointsInternal( void )
 
 	pskinref = (short *)((byte *)m_pStudioHeader + m_pStudioHeader->skinindex);
 	if( m_skinnum != 0 ) pskinref += (m_skinnum * m_pStudioHeader->numskinref);
+
+	PS2_STUDIO_ADD( DRAWS, 1 );
+	PS2_STUDIO_ADD( VERTS, m_pSubModel->numverts );
+	PS2_STUDIO_ADD( NORMS, m_pSubModel->numnorms );
+	PS2_STUDIO_BEGIN( VERTS );
 
 	if( FBitSet( m_pStudioHeader->flags, STUDIO_HAS_BONEWEIGHTS ) && m_pSubModel->blendvertinfoindex != 0 && m_pSubModel->blendnorminfoindex != 0 )
 	{
@@ -2657,12 +2857,21 @@ static void R_StudioDrawPointsInternal( void )
 	}
 	else
 	{
-		for( i = 0; i < m_pSubModel->numverts; i++ )
+#if XASH_PS2
+		if( !g_studio.numlocallights )
+			R_StudioTransformVertsPS2( pvertbone, (const vec3_t *)pstudioverts, m_pSubModel->numverts );
+		else
+#endif
 		{
-			Matrix3x4_VectorTransform( g_studio.bonestransform[pvertbone[i]], pstudioverts[i], g_studio.verts[i] );
-			R_LightStrength( pvertbone[i], pstudioverts[i], g_studio.lightpos[i] );
+			for( i = 0; i < m_pSubModel->numverts; i++ )
+			{
+				Matrix3x4_VectorTransform( g_studio.bonestransform[pvertbone[i]], pstudioverts[i], g_studio.verts[i] );
+				R_LightStrength( pvertbone[i], pstudioverts[i], g_studio.lightpos[i] );
+			}
 		}
 	}
+
+	PS2_STUDIO_END( VERTS );
 
 	// generate shared normals for properly scaling glowing shell
 	if( RI.currententity->curstate.renderfx == kRenderFxGlowShell )
@@ -2672,6 +2881,8 @@ static void R_StudioDrawPointsInternal( void )
 		R_StudioBuildNormalTable();
 		R_StudioGenerateNormals();
 	}
+
+	PS2_STUDIO_BEGIN( LIGHT );
 
 	for( j = k = 0; j < m_pSubModel->nummesh; j++ )
 	{
@@ -2684,6 +2895,19 @@ static void R_StudioDrawPointsInternal( void )
 		if( FBitSet( g_nFaceFlags, STUDIO_NF_MASKED|STUDIO_NF_ADDITIVE ))
 			need_sort = true;
 
+#if XASH_PS2
+		if( !g_studio.numlocallights && !FBitSet( g_nFaceFlags, STUDIO_NF_CHROME )
+			&& RI.currententity->curstate.rendermode != kRenderTransAdd )
+		{
+			const int count = pmesh[j].numnorms;
+			R_StudioLightNormalsPS2( k, count, pnormbone, (const vec3_t *)pstudionorms,
+				g_nFaceFlags | lodflags, FBitSet( m_pStudioHeader->flags, STUDIO_HAS_BONEWEIGHTS ));
+			k += count;
+			pstudionorms += count;
+			pnormbone += count;
+			continue;
+		}
+#endif
 		if( RI.currententity->curstate.rendermode == kRenderTransAdd )
 		{
 			for( i = 0; i < pmesh[j].numnorms; i++, k++, pstudionorms++, pnormbone++ )
@@ -2706,7 +2930,20 @@ static void R_StudioDrawPointsInternal( void )
 				VectorScale( g_studio.lightcolor, lv_tmp, g_studio.lightvalues[k] );
 			}
 		}
+#if XASH_PS2
+		if( !g_studio.numlocallights )
+		{
+			// Chrome/additive meshes still use the original lighting calculations.
+			for( i = k - pmesh[j].numnorms; i < k; i++ )
+			{
+				const float *lv = g_studio.lightvalues[i];
+				g_studio_rgb[i] = (uint)(byte)( lv[0] * 255 ) | (uint)(byte)( lv[1] * 255 ) << 8 | (uint)(byte)( lv[2] * 255 ) << 16;
+			}
+		}
+#endif
 	}
+
+	PS2_STUDIO_END( LIGHT );
 
 	if( r_studio_sort_textures->value && need_sort )
 	{
@@ -2716,6 +2953,8 @@ static void R_StudioDrawPointsInternal( void )
 
 	// NOTE: rewind normals at start
 	pstudionorms = (vec3_t *)((byte *)m_pStudioHeader + m_pSubModel->normindex);
+
+	PS2_STUDIO_BEGIN( MESH );
 
 	for( j = 0; j < m_pSubModel->nummesh; j++ )
 	{
@@ -2757,7 +2996,11 @@ static void R_StudioDrawPointsInternal( void )
 			else sceGuBlendFunc( GU_ADD, GU_SRC_ALPHA, GU_FIX, 0, GUBLEND1 );
 		}
 
-		R_StudioSetupSkin( m_pStudioHeader, pskinref[pmesh->skinref] );
+		{
+			PS2_STUDIO_BEGIN( SKIN );
+			R_StudioSetupSkin( m_pStudioHeader, pskinref[pmesh->skinref] );
+			PS2_STUDIO_END( SKIN );
+		}
 #ifdef STUDIO_DRAWELEMENTS
 		if( CVAR_TO_BOOL(r_studio_drawelements) )
 		{
@@ -2795,6 +3038,8 @@ static void R_StudioDrawPointsInternal( void )
 		r_stats.c_studio_polys += pmesh->numtris;
 		tr.blend = oldblend;
 	}
+
+	PS2_STUDIO_END( MESH );
 }
 
 /*
@@ -3448,7 +3693,16 @@ StudioRenderFinal
 
 ====================
 */
+static void R_StudioRenderFinalInternal( void );
+
 void R_StudioRenderFinal( void )
+{
+	PS2_STUDIO_BEGIN( FINAL );
+	R_StudioRenderFinalInternal();
+	PS2_STUDIO_END( FINAL );
+}
+
+static void R_StudioRenderFinalInternal( void )
 {
 	int	i, rendermode;
 
@@ -3947,9 +4201,11 @@ void R_StudioDrawModelInternal( cl_entity_t *e, int flags )
 	else
 	{
 		// select the properly method
+		PS2_STUDIO_BEGIN( TOTAL );
 		if( e->player )
 			pStudioDraw->StudioDrawPlayer( flags, R_StudioGetPlayerState( e->index - 1 ));
 		else pStudioDraw->StudioDrawModel( flags );
+		PS2_STUDIO_END( TOTAL );
 	}
 }
 
@@ -4458,6 +4714,24 @@ static void *pfnMod_Calloc( int number, size_t size )
 {
 	return gEngfuncs.Mod_Calloc( number, size );
 }
+
+#if defined( __PS2__ )
+static void R_StudioDynamicLightTimed( cl_entity_t *ent, alight_t *plight )
+{
+	PS2_STUDIO_BEGIN( DLIGHT );
+	R_StudioDynamicLight( ent, plight );
+	PS2_STUDIO_END( DLIGHT );
+}
+
+static void R_StudioEntityLightTimed( alight_t *lightinfo )
+{
+	PS2_STUDIO_BEGIN( DLIGHT );
+	R_StudioEntityLight( lightinfo );
+	PS2_STUDIO_END( DLIGHT );
+}
+#define R_StudioDynamicLight R_StudioDynamicLightTimed
+#define R_StudioEntityLight R_StudioEntityLightTimed
+#endif
 
 static engine_studio_api_t gStudioAPI =
 {

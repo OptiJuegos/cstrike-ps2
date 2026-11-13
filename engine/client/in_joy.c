@@ -57,6 +57,10 @@ static struct joy_axis_s
 static byte currentbinding; // add posibility to remap keys, to place it in joykeys[]
 convar_t *joy_enable;
 static convar_t *joy_pitch;
+static convar_t *joy_slow;
+static qboolean joy_slow_held;
+static void Joy_SlowDown_f( void ) { joy_slow_held = true; }
+static void Joy_SlowUp_f( void ) { joy_slow_held = false; }
 static convar_t *joy_yaw;
 static convar_t *joy_forward;
 static convar_t *joy_side;
@@ -344,15 +348,31 @@ Append movement from axis. Called everyframe
 */
 void Joy_FinalizeMove( float *fw, float *side, float *dpitch, float *dyaw )
 {
+	float look_time;
+
 	if( !Joy_IsActive() )
 		return;
+
+#if XASH_PS2
+	// Older PS2 gamepad menus could save the right-stick axes in reverse.
+	// Migrate only that known layout so right Y pitches and right X yaws.
+	if( joy_axis_binding->string[0] == 's' && joy_axis_binding->string[1] == 'f' &&
+		joy_axis_binding->string[2] == 'y' && joy_axis_binding->string[3] == 'p' )
+	{
+		char fixed_map[MAX_AXES + 1];
+		Q_strncpy( fixed_map, joy_axis_binding->string, sizeof( fixed_map ) );
+		fixed_map[2] = 'p';
+		fixed_map[3] = 'y';
+		Cvar_Set( "joy_axis_binding", fixed_map );
+	}
+#endif
 
 	if( FBitSet( joy_axis_binding->flags, FCVAR_CHANGED ) )
 	{
 		const char *bind = joy_axis_binding->string;
 		size_t i;
 
-		for( i = 0; bind[i]; i++ )
+		for( i = 0; i < MAX_AXES && bind[i]; i++ )
 		{
 			switch( bind[i] )
 			{
@@ -365,19 +385,33 @@ void Joy_FinalizeMove( float *fw, float *side, float *dpitch, float *dyaw )
 			default : joyaxesmap[i] = JOY_AXIS_NULL; break;
 			}
 		}
+		for( ; i < MAX_AXES; i++ )
+			joyaxesmap[i] = JOY_AXIS_NULL;
+#if XASH_PS2
+		// Clear axes that belonged to the old layout before reading the pad again.
+		for( i = 0; i < MAX_AXES; i++ )
+			joyaxis[i].val = joyaxis[i].prevval = 0;
+#endif
 
 		ClearBits( joy_axis_binding->flags, FCVAR_CHANGED );
 	}
 
+	// +joyslow held: finer aim, look speed scaled by joy_slow
+	look_time = host.realframetime * ( joy_slow_held ? joy_slow->value : 1.0f );
+
 	*fw     -= joy_forward->value * (float)joyaxis[JOY_AXIS_FWD ].val/(float)SHRT_MAX;  // must be form -1.0 to 1.0
 	*side   += joy_side->value    * (float)joyaxis[JOY_AXIS_SIDE].val/(float)SHRT_MAX;
-#if !defined(XASH_SDL)
-	*dpitch += joy_pitch->value * (float)joyaxis[JOY_AXIS_PITCH].val/(float)SHRT_MAX * host.realframetime;  // abs axis rotate is frametime related
-	*dyaw   -= joy_yaw->value   * (float)joyaxis[JOY_AXIS_YAW  ].val/(float)SHRT_MAX * host.realframetime;
+#if XASH_PS2
+	// IN_CollectInput passes (yaw, pitch) here: dpitch is real yaw, dyaw is real pitch.
+	*dpitch -= joy_yaw->value   * (float)joyaxis[JOY_AXIS_YAW  ].val/(float)SHRT_MAX * look_time;
+	*dyaw   += joy_pitch->value * (float)joyaxis[JOY_AXIS_PITCH].val/(float)SHRT_MAX * look_time;
+#elif !defined(XASH_SDL)
+	*dpitch += joy_pitch->value * (float)joyaxis[JOY_AXIS_PITCH].val/(float)SHRT_MAX * look_time;  // abs axis rotate is frametime related
+	*dyaw   -= joy_yaw->value   * (float)joyaxis[JOY_AXIS_YAW  ].val/(float)SHRT_MAX * look_time;
 #else
 	// HACKHACK: SDL have inverted look axis.
-	*dpitch -= joy_pitch->value * (float)joyaxis[JOY_AXIS_PITCH].val/(float)SHRT_MAX * host.realframetime;
-	*dyaw   += joy_yaw->value   * (float)joyaxis[JOY_AXIS_YAW  ].val/(float)SHRT_MAX * host.realframetime;
+	*dpitch -= joy_pitch->value * (float)joyaxis[JOY_AXIS_PITCH].val/(float)SHRT_MAX * look_time;
+	*dyaw   += joy_yaw->value   * (float)joyaxis[JOY_AXIS_YAW  ].val/(float)SHRT_MAX * look_time;
 #endif
 }
 
@@ -390,6 +424,9 @@ Main init procedure
 */
 void Joy_Init( void )
 {
+	joy_slow    = Cvar_Get( "joy_slow",    "0.35", FCVAR_ARCHIVE, "look speed scale while +joyslow is held" );
+	Cmd_AddCommand( "+joyslow", Joy_SlowDown_f, "slow down joystick look while held (scale: joy_slow)" );
+	Cmd_AddCommand( "-joyslow", Joy_SlowUp_f, "back to full joystick look speed" );
 	joy_pitch   = Cvar_Get( "joy_pitch",   "100.0", FCVAR_ARCHIVE, "joystick pitch sensitivity" );
 	joy_yaw     = Cvar_Get( "joy_yaw",     "100.0", FCVAR_ARCHIVE, "joystick yaw sensitivity" );
 #if XASH_PSP
@@ -410,13 +447,26 @@ void Joy_Init( void )
 	joy_side_key_threshold = Cvar_Get( "joy_side_key_threshold", "24576", FCVAR_ARCHIVE, "side axis key event emit threshold. Value from 0 to 32767" );
 	joy_forward_key_threshold = Cvar_Get( "joy_forward_key_threshold", "24576", FCVAR_ARCHIVE, "forward axis key event emit threshold. Value from 0 to 32767");
 
-	// by default, we rely on deadzone detection come from system, but some glitchy devices report false deadzones
-	joy_side_deadzone = Cvar_Get( "joy_side_deadzone", "0", FCVAR_ARCHIVE, "side axis deadzone. Value from 0 to 32767" );
-	joy_forward_deadzone = Cvar_Get( "joy_forward_deadzone", "0", FCVAR_ARCHIVE, "forward axis deadzone. Value from 0 to 32767");
-	joy_pitch_deadzone = Cvar_Get( "joy_pitch_deadzone", "0", FCVAR_ARCHIVE, "pitch axis deadzone. Value from 0 to 32767");
-	joy_yaw_deadzone = Cvar_Get( "joy_yaw_deadzone", "0", FCVAR_ARCHIVE, "yaw axis deadzone. Value from 0 to 32767" );
+	// Worn DualShock 2 sticks drift far off center: ignore anything under 80%.
+	#if XASH_PS2
+	#define JOY_DEFAULT_DEADZONE "26214"
+	#else
+	#define JOY_DEFAULT_DEADZONE "0"
+	#endif
+	joy_side_deadzone = Cvar_Get( "joy_side_deadzone", JOY_DEFAULT_DEADZONE, FCVAR_ARCHIVE, "side axis deadzone. Value from 0 to 32767" );
+	joy_forward_deadzone = Cvar_Get( "joy_forward_deadzone", JOY_DEFAULT_DEADZONE, FCVAR_ARCHIVE, "forward axis deadzone. Value from 0 to 32767");
+	joy_pitch_deadzone = Cvar_Get( "joy_pitch_deadzone", JOY_DEFAULT_DEADZONE, FCVAR_ARCHIVE, "pitch axis deadzone. Value from 0 to 32767");
+	joy_yaw_deadzone = Cvar_Get( "joy_yaw_deadzone", JOY_DEFAULT_DEADZONE, FCVAR_ARCHIVE, "yaw axis deadzone. Value from 0 to 32767" );
+	#undef JOY_DEFAULT_DEADZONE
 
-	joy_axis_binding = Cvar_Get( "joy_axis_binding", XASH_PSP ? "pysf" : "sfpyrl", FCVAR_ARCHIVE, "axis hardware id to engine inner axis binding, "
+		#if XASH_PSP
+	joy_axis_binding = Cvar_Get( "joy_axis_binding", "pysf", FCVAR_ARCHIVE, "axis hardware id to engine inner axis binding, "
+		#elif XASH_PS2
+		// DualShock 2: left X/Y controls movement; right Y/X controls the camera.
+		joy_axis_binding = Cvar_Get( "joy_axis_binding", "sfpy", FCVAR_ARCHIVE, "axis hardware id to engine inner axis binding, "
+	#else
+	joy_axis_binding = Cvar_Get( "joy_axis_binding", "sfpyrl", FCVAR_ARCHIVE, "axis hardware id to engine inner axis binding, "
+	#endif
 		"s - side, f - forward, y - yaw, p - pitch, r - left trigger, l - right trigger" );
 	joy_found   = Cvar_Get( "joy_found", "0", FCVAR_READ_ONLY, "is joystick is connected" );
 	// we doesn't loaded config.cfg yet, so this cvar is not archive.

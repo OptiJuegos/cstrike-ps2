@@ -173,7 +173,7 @@ void Mod_ReleaseHullPolygons( void );
 //
 // mod_studio.c
 //
-void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded );
+void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded, qboolean *fileAdopted );
 void Mod_UnloadStudioModel( model_t *mod );
 void Mod_InitStudioAPI( void );
 void Mod_InitStudioHull( void );

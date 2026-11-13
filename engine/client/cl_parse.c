@@ -21,9 +21,7 @@ GNU General Public License for more details.
 #include "shake.h"
 #include "hltv.h"
 #include "input.h"
-#if XASH_LOW_MEMORY != 2
 int CL_UPDATE_BACKUP = SINGLEPLAYER_BACKUP;
-#endif
 /*
 ===============
 CL_UserMsgStub
@@ -219,6 +217,9 @@ CL_ParseSignon
 void CL_ParseSignon( sizebuf_t *msg )
 {
 	int	i = MSG_ReadByte( msg );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CL_SIGNON_RECEIVED signon=%d previous=%d\n", i, cls.signon );
+	#endif
 
 	if( i <= cls.signon )
 	{
@@ -229,6 +230,9 @@ void CL_ParseSignon( sizebuf_t *msg )
 
 	cls.signon = i;
 	CL_SignonReply();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CL_SIGNON_REPLY_DONE signon=%d\n", cls.signon );
+	#endif
 }
 
 /*
@@ -870,6 +874,16 @@ void CL_ParseServerData( sizebuf_t *msg )
 		CL_ClearState ();
 	cls.state = ca_connected;
 
+#if XASH_PS2
+	{
+		// sv_init.c frees them for local games; online play reaches only this
+		void UI_PS2ReleaseBackground( void ) __attribute__(( weak )); // absent without MainUI
+
+		if( UI_PS2ReleaseBackground )
+			UI_PS2ReleaseBackground();
+	}
+#endif
+
 	// parse protocol version number
 	i = MSG_ReadLong( msg );
 
@@ -1510,8 +1524,20 @@ void CL_SendConsistencyInfo( sizebuf_t *msg )
 		switch( pc->check_type )
 		{
 		case force_exactfile:
-			MD5_HashFile( md5, filename, NULL );
-			pc->value = *(int *)md5;
+			#if XASH_PS2
+			if( !Q_stricmp( filename, "sprites/fast_wallpuff1.spr" ))
+				printf( "[XASH-PS2] STAGE=CONSISTENCY_CLIENT_MD5 file=%s ok=%d ", filename,
+					(int)MD5_HashFile( md5, filename, NULL ));
+			else
+			#endif
+				MD5_HashFile( md5, filename, NULL );
+			// Preserve the hash's exact first four bytes; do not type-pun a
+			// digest byte array as a signed int on MIPS64.
+			memcpy( &pc->value, md5, sizeof( pc->value ));
+			#if XASH_PS2
+			if( !Q_stricmp( filename, "sprites/fast_wallpuff1.spr" ))
+				printf( "value=%08x index=%d changed=%d\n", (unsigned)pc->value, pc->orig_index, user_changed_diskfile );
+			#endif
 
 			if( user_changed_diskfile )
 				MSG_WriteUBitLong( msg, 0, 32 );
@@ -1996,6 +2022,11 @@ void CL_ParseUserMessage( sizebuf_t *msg, int svc_num )
 
 	if( i == MAX_USER_MESSAGES ) // probably unregistered
 		Host_Error( "CL_ParseUserMessage: illegible server message %d\n", svc_num );
+	#if XASH_PS2
+	if( svc_num == 91 )
+		printf( "[XASH-PS2] STAGE=USERMSG_91_RESOLVED slot=%d name=%s size=%d func=%p\n",
+			i, clgame.msg[i].name, clgame.msg[i].size, (void *)clgame.msg[i].func );
+	#endif
 
 	// NOTE: some user messages handled into engine
 	if( !Q_strcmp( clgame.msg[i].name, "ScreenShake" ))
@@ -2036,7 +2067,15 @@ void CL_ParseUserMessage( sizebuf_t *msg, int svc_num )
 
 	if( clgame.msg[i].func )
 	{
+		#if XASH_PS2
+		if( svc_num == 91 )
+			printf( "[XASH-PS2] STAGE=USERMSG_91_INVOKE name=%s size=%d func=%p\n",
+				clgame.msg[i].name, iSize, (void *)clgame.msg[i].func );
+		#endif
 		clgame.msg[i].func( clgame.msg[i].name, iSize, pbuf );
+		#if XASH_PS2
+		if( svc_num == 91 ) printf( "[XASH-PS2] STAGE=USERMSG_91_RETURN\n" );
+		#endif
 
 #ifdef HACKS_RELATED_HLMODS
 		// run final credits for Half-Life because hl1 doesn't have call END_SECTION
@@ -2075,6 +2114,12 @@ void CL_ParseServerMessage( sizebuf_t *msg, qboolean normal_message )
 	int		cmd, param1, param2;
 	int		old_background;
 	const char	*s;
+	#if XASH_PS2
+	// Keep enough signon diagnostics to identify a bad command without
+	// flooding the PS2 serial console on every normal server update.
+	static int ps2_command_traces;
+	#define PS2_NET_TRACE_COMMAND_LIMIT 48
+	#endif
 
 	cls.starting_count = MSG_GetNumBytesRead( msg );	// updates each frame
 	CL_Parse_Debug( true );			// begin parsing
@@ -2113,6 +2158,11 @@ void CL_ParseServerMessage( sizebuf_t *msg, qboolean normal_message )
 
 		// record command for debugging spew on parse problem
 		CL_Parse_RecordCommand( cmd, bufStart );
+		#if XASH_PS2
+		if( cls.signon >= SIGNONS - 1 && ps2_command_traces++ < PS2_NET_TRACE_COMMAND_LIMIT )
+			printf( "[XASH-PS2] STAGE=CL_NET_CMD_BEGIN cmd=%d byte=%u signon=%d\n",
+				cmd, (unsigned)bufStart, cls.signon );
+		#endif
 
 		// other commands
 		switch( cmd )
@@ -2342,6 +2392,10 @@ void CL_ParseServerMessage( sizebuf_t *msg, qboolean normal_message )
 			cl.frames[cl.parsecountmod].graphdata.usr += MSG_GetNumBytesRead( msg ) - bufStart;
 			break;
 		}
+		#if XASH_PS2
+		if( cls.signon >= SIGNONS - 1 && ps2_command_traces <= PS2_NET_TRACE_COMMAND_LIMIT )
+			printf( "[XASH-PS2] STAGE=CL_NET_CMD_DONE cmd=%d signon=%d\n", cmd, cls.signon );
+		#endif
 	}
 
 	cl.frames[cl.parsecountmod].graphdata.msgbytes += MSG_GetNumBytesRead( msg ) - cls.starting_count;

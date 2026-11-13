@@ -512,12 +512,19 @@ void Cmd_ForwardToServer( void );
 void Memory_Init( void );
 void *_Mem_Realloc( byte *poolptr, void *memptr, size_t size, qboolean clear, const char *filename, int fileline );
 void *_Mem_Alloc( byte *poolptr, size_t size, qboolean clear, const char *filename, int fileline );
+#if XASH_PS2
+void *_Mem_PS2RehomeShrink( byte *newpool, void *memptr, size_t size, const char *filename, int fileline );
+#define Mem_PS2RehomeShrink( pool, ptr, size ) _Mem_PS2RehomeShrink( pool, ptr, size, __FILE__, __LINE__ )
+#endif
 byte *_Mem_AllocPool( const char *name, const char *filename, int fileline );
 void _Mem_FreePool( byte **poolptr, const char *filename, int fileline );
 void _Mem_EmptyPool( byte *poolptr, const char *filename, int fileline );
 void _Mem_Free( void *data, const char *filename, int fileline );
 void _Mem_Check( const char *filename, int fileline );
 qboolean Mem_IsAllocatedExt( byte *poolptr, void *data );
+#if XASH_PS2
+int Mem_PS2CountAllocs( byte *poolptr ); // blocks still allocated in a pool
+#endif
 void Mem_PrintList( size_t minallocationsize );
 void Mem_PrintStats( void );
 
@@ -546,6 +553,9 @@ void FS_LoadGameInfo( const char *rootfolder );
 const char *FS_GetDiskPath( const char *name, qboolean gamedironly );
 byte *W_LoadLump( wfile_t *wad, const char *lumpname, size_t *lumpsizeptr, const char type );
 void W_Close( wfile_t *wad );
+#if XASH_PS2
+void FS_PS2ReleaseWads( void );
+#endif
 byte *FS_LoadFile( const char *path, fs_offset_t *filesizeptr, qboolean gamedironly );
 qboolean CRC32_File( dword *crcvalue, const char *filename );
 qboolean MD5_HashFile( byte digest[16], const char *pszFileName, uint seed[4] );
@@ -724,6 +734,21 @@ void CL_Shutdown( void );
 void Host_ClientBegin( void );
 void Host_ClientFrame( void );
 int CL_Active( void );
+
+// cl_split.c: local splitscreen, player 2 is a fake client fed by the second gamepad
+void CL_SplitInit( void );
+void CL_IntroInit( void );
+qboolean CL_IntroDraw( void );
+qboolean CL_IntroKeyEvent( int key, int down );
+void CL_SplitKeyEvent( int key, qboolean down );	// second pad, first pad's key numbers
+void CL_SplitAxisEvent( int axis, short value );	// second pad, Joy_AxisMotionEvent order
+void CL_SplitServerFrame( void );
+struct edict_s *CL_SplitEdict( void );
+struct edict_s *CL_SplitViewEdict( void );
+qboolean CL_SplitView( int *entnum, vec3_t origin, vec3_t angles, float *fov );
+void CL_SplitUserMessage( const char *name, const byte *data, int size );	// server user message to player 2
+qboolean CL_SplitEventBegin( int entindex );	// player 2's client event: runs as the local player
+void CL_SplitEventEnd( void );
 
 void SV_Init( void );
 void SV_Shutdown( const char *finalmsg );
@@ -926,6 +951,11 @@ void Con_Init( void );
 void SCR_Init( void );
 void SCR_UpdateScreen( void );
 void SCR_BeginLoadingPlaque( qboolean is_background );
+#if XASH_PS2
+void SCR_LoadingStatus( const char *what ); // loading screen text, redraws at most 4 times/s
+void SCR_BootStatus( const char *what, int step, int steps ); // same screen during engine start-up
+void SCR_BootEnd( void );
+#endif
 void SCR_CheckStartupVids( void );
 int SCR_GetAudioChunk( char *rawdata, int length );
 wavdata_t *SCR_GetMovieInfo( void );

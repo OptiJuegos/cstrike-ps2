@@ -28,6 +28,15 @@ Based on clipping system from PSP Quake by Peter Mackay and Chris Swindle.
 
 #include "gu_local.h"
 
+#if XASH_PS2
+// ref_gs/gs_gu.c clips each triangle in clip space, so nothing is done here
+void GU_ClipSetWorldFrustum( const matrix4x4 in ) { (void)in; }
+void GU_ClipRestoreWorldFrustum( void ) { }
+void GU_ClipSetModelFrustum( const matrix4x4 in ) { (void)in; }
+int GU_ClipIsRequired( gu_vert_t *uv, int uvc ) { (void)uv; (void)uvc; return 0; }
+void GU_Clip( gu_vert_t *uv, int uvc, gu_vert_t **cv, int *cvc ) { (void)uv; (void)uvc; (void)cv; *cvc = 0; }
+#else
+
 #define MAX_CLIPPED_VERTICES	32
 
 // Cache
@@ -335,3 +344,4 @@ void GU_Clip( gu_vert_t *uv, int uvc, gu_vert_t **cv, int* cvc )
 	if (!( *cvc )) return;
 	extGuEndPacket(( void * )( *cv + *cvc ));
 }
+#endif // XASH_PS2

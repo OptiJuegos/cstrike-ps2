@@ -36,7 +36,11 @@ Studio models are position independent, so the cache manager can move them.
 #define MAXSTUDIOSEQUENCES		256	// total animation sequences
 #define MAXSTUDIOSKINS		256	// total textures
 #define MAXSTUDIOSRCBONES		512	// bones allowed at source movement
+#ifdef _EE
+#define MAXSTUDIOBONES		64	// PS2: CS models use at most 58 (v_shield_r.mdl); keep engine, client and game in sync
+#else
 #define MAXSTUDIOBONES		128	// total bones actually used
+#endif
 #define MAXSTUDIOMODELS		32	// sub-models per model
 #define MAXSTUDIOBODYPARTS		32	// body parts per submodel
 #define MAXSTUDIOGROUPS		16	// sequence groups (e.g. barney01.mdl, barney02.mdl, e.t.c)

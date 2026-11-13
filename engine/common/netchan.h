@@ -111,7 +111,14 @@ GNU General Public License for more details.
 	#undef NUM_PACKET_ENTITIES
 	#undef MAX_CUSTOM_BASELINES
 	#undef NET_MAX_FRAGMENT
-	#define MULTIPLAYER_BACKUP		4	// breaks protocol in legacy mode, new protocol status unknown
+	// online the client drops deltas 3+ packets old (CL_UPDATE_MASK): with 4
+	// any ping above ~75 ms lost every update. 8 is ~175 ms at 40 updates/s,
+	// 16 ~375 ms. Each slot is 23.6 KB of static cl.frames on the PS2
+#if XASH_PS2
+	#define MULTIPLAYER_BACKUP		8
+#else
+	#define MULTIPLAYER_BACKUP		16
+#endif
 	#define SINGLEPLAYER_BACKUP		4
 	#define NUM_PACKET_ENTITIES		32
 	#define MAX_CUSTOM_BASELINES		8
@@ -154,7 +161,7 @@ typedef struct netsplit_packet_s
 
 typedef struct netsplit_s
 {
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	// [NETSPLIT_BACKUP], allocated on the first split packet: only the
 	// client's channel ever gets any (see netchan_t below)
 	netsplit_chain_packet_t *packets;
@@ -260,7 +267,7 @@ typedef struct netchan_s
 
 	// staging and holding areas
 	sizebuf_t		message;
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	// NET_MAX_MESSAGE each, allocated by Netchan_Setup and kept with the
 	// server slot (Netchan_FreeBuffers). Bots never set up a channel, they
 	// were 64 KB of unused buffers per bot (plus 64 KB of netsplit) when
@@ -273,8 +280,8 @@ typedef struct netchan_s
 	// reliable message buffer.
 	// we keep adding to it until reliable is acknowledged.  Then we clear it.
 	int		reliable_length;
-#if XASH_PSP
-	byte		*reliable_buf;
+	#if XASH_PSP || XASH_PS2
+		byte		*reliable_buf;
 #else
 	byte		reliable_buf[NET_MAX_MESSAGE];	// unacked reliable message (max size for loopback connection)
 #endif
@@ -324,7 +331,7 @@ extern int		net_drop;
 
 void Netchan_Init( void );
 void Netchan_Shutdown( void );
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 void Netchan_FreeBuffers( netchan_t *chan );
 #endif
 void Netchan_Setup( netsrc_t sock, netchan_t *chan, netadr_t adr, int qport, void *client, int (*pfnBlockSize)(void *, fragsize_t mode ) );

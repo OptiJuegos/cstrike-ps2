@@ -13,6 +13,8 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 */
 
+#include "build.h"
+#if !XASH_PS2 // extGu* are in ref_gs/gs_gu.c
 #include <pspkernel.h>
 #include <pspge.h>
 #include <pspgu.h>
@@ -77,3 +79,4 @@ void extGuEndPacket( void *eaddr )
 			sceGeListUpdateStallAddr( ge_list_executed[0], new_ptr );
 	}
 }
+#endif // !XASH_PS2

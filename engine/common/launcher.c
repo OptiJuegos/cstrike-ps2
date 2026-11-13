@@ -19,6 +19,9 @@ GNU General Public License for more details.
 #include <string.h>
 #include "build.h"
 #include "common.h"
+#if XASH_PS2
+#include "fs_paths_ps2.h"
+#endif
 #ifdef XASH_SDLMAIN
 #include "SDL.h"
 #endif
@@ -50,6 +53,7 @@ void Launcher_ChangeGame( const char *progname )
 #if XASH_NOCONHOST
 #include <windows.h>
 #include <shellapi.h> // CommandLineToArgvW
+int main( int argc, char **argv );
 int __stdcall WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR cmdLine, int nShow)
 {
 	int szArgc;
@@ -73,6 +77,7 @@ int __stdcall WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR cmdLine, int n
 	for( i = 0; i < szArgc; ++i )
 		free( szArgv[i] );
 	free( szArgv );
+	return 0;
 }
 #endif
 
@@ -80,6 +85,10 @@ int main( int argc, char** argv )
 {
 	char gamedir_buf[32] = "";
 	const char *gamedir = getenv( "XASH3D_GAMEDIR" );
+#if XASH_PS2
+	PS2_FS_SetLaunchPath( argc > 0 && argv ? argv[0] : NULL );
+	PS2_EarlyInit();
+#endif
 
 	if( !COM_CheckString( gamedir ) )
 	{

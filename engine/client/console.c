@@ -27,6 +27,15 @@ convar_t	*scr_conspeed;
 convar_t	*con_fontsize;
 convar_t	*con_charset;
 convar_t	*con_fontscale;
+static convar_t	*con_buildlabel;
+
+// "<os>-<arch> build <n>", or con_buildlabel when set
+static const char *Con_BuildLabel( void )
+{
+	if( con_buildlabel && COM_CheckString( con_buildlabel->string ))
+		return con_buildlabel->string;
+	return va( "%s-%s build %i", Q_buildos(), Q_buildarch(), Q_buildnum( ));
+}
 convar_t	*con_fontnum;
 
 static int g_codepage = 0;
@@ -35,12 +44,22 @@ static qboolean g_utf8 = false;
 #define CON_TIMES		4	// notify lines
 #define CON_MAX_TIMES	64	// notify max lines
 #define COLOR_DEFAULT	'7'
+#if XASH_PS2
+#define CON_HISTORY		16	// both index modulo/bounds-checked: smaller only forgets sooner
+#define MAX_DBG_NOTIFY	32
+#else
 #define CON_HISTORY		64
 #define MAX_DBG_NOTIFY	128
+#endif
 #if XASH_LOW_MEMORY
 #define CON_NUMFONTS	1		// do not load different font textures
+#if XASH_PS2
+#define CON_TEXTSIZE	8192	// logs go to printf; the console only shows recent lines
+#define CON_MAXLINES	512
+#else
 #define CON_TEXTSIZE	32768	// max scrollback buffer characters in console (32 kb)
 #define CON_MAXLINES	2048	// max scrollback buffer lines in console
+#endif
 #else
 #define CON_NUMFONTS	3	// maxfonts
 #define CON_TEXTSIZE	1048576	// max scrollback buffer characters in console (1 Mb)
@@ -867,7 +886,7 @@ static void Con_TextAdjustSize( int *x, int *y, int *w, int *h )
 
 	// scale for screen sizes
 	xscale = (float)refState.width / (float)clgame.scrInfo.iWidth;
-	yscale = (float)refState.height / (float)clgame.scrInfo.iHeight;
+	yscale = (float)CL_HUD_HEIGHT / (float)clgame.scrInfo.iHeight;
 
 	if( x ) *x *= xscale;
 	if( y ) *y *= yscale;
@@ -1173,6 +1192,7 @@ void Con_Init( void )
 	con_fontsize = Cvar_Get( "con_fontsize", "1", FCVAR_ARCHIVE, "console font number (0, 1 or 2)" );
 	con_charset = Cvar_Get( "con_charset", "cp1251", FCVAR_ARCHIVE, "console font charset (only cp1251 supported now)" );
 	con_fontscale = Cvar_Get( "con_fontscale", "1.0", FCVAR_ARCHIVE, "scale font texture" );
+	con_buildlabel = Cvar_Get( "con_buildlabel", "", 0, "text shown in place of \"<os>-<arch> build <n>\" in the version line (empty: the build)" );
 	con_fontnum = Cvar_Get( "con_fontnum", "-1", FCVAR_ARCHIVE, "console font number (0, 1 or 2), -1 for autoselect" );
 
 	// init the console buffer
@@ -2130,7 +2150,7 @@ void Con_DrawSolidConsole( int lines )
 		memcpy( color, g_color_table[7], sizeof( color ));
 
 
-		Q_snprintf( curbuild, MAX_STRING, "%s %i/%s (%s-%s build %i)", XASH_ENGINE_NAME, PROTOCOL_VERSION, XASH_VERSION, Q_buildos(), Q_buildarch(), Q_buildnum( ));
+		Q_snprintf( curbuild, MAX_STRING, "%s %i/%s (%s)", XASH_ENGINE_NAME, PROTOCOL_VERSION, XASH_VERSION, Con_BuildLabel( ));
 
 		Con_DrawStringLen( curbuild, &stringLen, &charH );
 		start = refState.width - stringLen;
@@ -2201,7 +2221,12 @@ void Con_DrawConsole( void )
 	{
 		if( !cl_allow_levelshots->value )
 		{
+#if XASH_PS2
+			// loading screen instead of the console, unless it was opened by hand
+			if( cls.key_dest != key_console )
+#else
 			if(( Cvar_VariableInteger( "cl_background" ) || Cvar_VariableInteger( "sv_background" )) && cls.key_dest != key_console )
+#endif
 				con.vislines = con.showlines = 0;
 			else con.vislines = con.showlines = refState.height;
 		}
@@ -2218,6 +2243,12 @@ void Con_DrawConsole( void )
 	switch( cls.state )
 	{
 	case ca_disconnected:
+#if XASH_PS2
+		// local map still loading, client not connected yet: SCR_UpdateScreen
+		// draws the loading plaque. A forced console here opens the OSK.
+		if( SV_Active( ) || ( SCR_IsLoading( ) && cls.key_dest != key_console ))
+			break;
+#endif
 		if( cls.key_dest != key_menu )
 		{
 			Con_DrawSolidConsole( refState.height );
@@ -2289,8 +2320,8 @@ void Con_DrawVersion( void )
 		host.force_draw_version = false;
 
 	if( host.force_draw_version || draw_version )
-		Q_snprintf( curbuild, MAX_STRING, "%s v%i/%s (%s-%s build %i)", XASH_ENGINE_NAME, PROTOCOL_VERSION, XASH_VERSION, Q_buildos(), Q_buildarch(), Q_buildnum( ));
-	else Q_snprintf( curbuild, MAX_STRING, "v%i/%s (%s-%s build %i)", PROTOCOL_VERSION, XASH_VERSION, Q_buildos(), Q_buildarch(), Q_buildnum( ));
+		Q_snprintf( curbuild, MAX_STRING, "%s v%i/%s (%s)", XASH_ENGINE_NAME, PROTOCOL_VERSION, XASH_VERSION, Con_BuildLabel( ));
+	else Q_snprintf( curbuild, MAX_STRING, "v%i/%s (%s)", PROTOCOL_VERSION, XASH_VERSION, Con_BuildLabel( ));
 
 	Con_DrawStringLen( curbuild, &stringLen, &charH );
 	start = refState.width - stringLen * 1.05f;

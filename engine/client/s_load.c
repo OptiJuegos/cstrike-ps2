@@ -20,7 +20,11 @@ GNU General Public License for more details.
 // than could actually be referenced during gameplay,
 // because we don't want to free anything until we are
 // sure we won't need it.
-#if XASH_PSP
+#if XASH_PS2 && XASH_SOUND == SOUND_NULL
+#define MAX_SFX		64	// nothing registers without dma.initialized
+#elif XASH_PS2
+#define MAX_SFX		1024	// 512 precached by the server (XASH_LOW_MEMORY) plus client sounds
+#elif XASH_PSP
 #define MAX_SFX		2048
 #else
 #define MAX_SFX		8192
@@ -31,6 +35,8 @@ static int	s_numSfx = 0;
 static sfx_t	s_knownSfx[MAX_SFX];
 static sfx_t	*s_sfxHashList[MAX_SFX_HASH];
 static string	s_sentenceImmediateName;	// keep dummy sentence name
+static uint	s_sfxLastUse[MAX_SFX];	// s_useCounter at the last S_LoadSound, for s_cachekb
+static uint	s_useCounter;
 qboolean		s_registering = false;
 int		s_registration_sequence = 0;
 
@@ -116,11 +122,108 @@ static wavdata_t *S_CreateDefaultSound( void )
 	sc->channels = 1;
 	sc->loopStart = -1;
 	sc->rate = SOUND_DMA_SPEED;
+#if XASH_PS2
+	sc->samples = SOUND_DMA_SPEED / 10; // silence: 0.1 s is as good as 1 s, and every missing file gets one
+#else
 	sc->samples = SOUND_DMA_SPEED;
+#endif
 	sc->size = sc->samples * sc->width * sc->channels;
 	sc->buffer = Mem_Calloc( sndpool, sc->size );
 
 	return sc;
+}
+
+/*
+=================
+S_SkipSound
+
+true when the name starts with one of the prefixes in s_skipsounds
+=================
+*/
+static qboolean S_SkipSound( const char *name )
+{
+	const char	*p = s_skipsounds ? s_skipsounds->string : "";
+	int	len;
+
+	if( *name == '*' ) name++;
+
+	while( *p )
+	{
+		while( *p == ' ' ) p++;
+		for( len = 0; p[len] && p[len] != ' '; len++ );
+		if( len && !Q_strnicmp( name, p, len ))
+			return true;
+		p += len;
+	}
+	return false;
+}
+
+/*
+=================
+S_SoundInUse
+
+true when a channel or a sentence word still reads this sound
+=================
+*/
+static qboolean S_SoundInUse( const sfx_t *sfx )
+{
+	const channel_t	*ch;
+	int	i, j;
+
+	for( i = 0, ch = channels; i < MAX_CHANNELS; i++, ch++ )
+	{
+		if( ch->sfx == sfx || ( ch->pMixer.pData && ch->pMixer.pData == sfx->cache ))
+			return true;
+		if( !ch->isSentence )
+			continue;
+		for( j = 0; j < CVOXWORDMAX; j++ )
+			if( ch->words[j].sfx == sfx )
+				return true;
+	}
+	return false;
+}
+
+/*
+=================
+S_TrimSoundCache
+
+Sounds load the first time they play and stay until the level ends, so a
+long match ends up holding every precached sound. Above s_cachekb, free the
+least recently played idle sounds; they reload from disk when played again.
+=================
+*/
+static void S_TrimSoundCache( const sfx_t *keep )
+{
+	size_t	limit, total = 0;
+	sfx_t	*sfx, *oldest;
+	int	i;
+
+	if( !s_cachekb || s_cachekb->value <= 0 )
+		return;
+	limit = (size_t)s_cachekb->value * 1024;
+
+	for( i = 0, sfx = s_knownSfx; i < s_numSfx; i++, sfx++ )
+		if( sfx->cache ) total += sfx->cache->size;
+
+	while( total > limit )
+	{
+		oldest = NULL;
+		for( i = 0, sfx = s_knownSfx; i < s_numSfx; i++, sfx++ )
+		{
+			if( !sfx->cache || sfx == keep || !Q_stricmp( sfx->name, "*default" ))
+				continue;
+			if( oldest && s_sfxLastUse[i] >= s_sfxLastUse[oldest - s_knownSfx] )
+				continue;
+			if( !S_SoundInUse( sfx ))
+				oldest = sfx;
+		}
+		if( !oldest )
+			break; // everything left is playing
+
+		total -= oldest->cache->size;
+		FS_FreeSound( oldest->cache );
+		oldest->cache = NULL;
+	}
 }
 
 /*
@@ -134,6 +237,8 @@ wavdata_t *S_LoadSound( sfx_t *sfx )
 
 	if( !sfx ) return NULL;
 
+	s_sfxLastUse[sfx - s_knownSfx] = ++s_useCounter;
+
 	// see if still in memory
 	if( sfx->cache )
 		return sfx->cache;
@@ -141,6 +246,13 @@ wavdata_t *S_LoadSound( sfx_t *sfx )
 	if( !COM_CheckString( sfx->name ))
 		return NULL;
 
+	// callers free the channel when there is no sound
+	if( S_SkipSound( sfx->name ))
+		return NULL;
+
+#if XASH_PS2
+	SCR_LoadingStatus( sfx->name );
+#endif
 	// load it from disk
 	if( Q_stricmp( sfx->name, "*default" ))
 	{
@@ -159,13 +271,14 @@ wavdata_t *S_LoadSound( sfx_t *sfx )
 	else if( sc->rate > SOUND_22k && sc->rate <= SOUND_32k ) // some bad sounds
 		Sound_Process( &sc, SOUND_44k, sc->width, SOUND_RESAMPLE );
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	// half the memory (a quarter for 44 kHz sounds): 8 bit, at most 22 kHz
 	if( sc->width == 2 || sc->rate > SOUND_22k )
 		Sound_Process( &sc, Q_min( sc->rate, SOUND_22k ), 1, SOUND_RESAMPLE );
 #endif
 
 	sfx->cache = sc;
+	S_TrimSoundCache( sfx );
 
 	return sfx->cache;
 }
@@ -320,7 +433,7 @@ void S_EndRegistration( void )
 			S_FreeSound( sfx ); // don't need this sound
 	}
 
-#if !XASH_PSP
+#if !XASH_PSP && !XASH_PS2
 	// load everything in
 	for( i = 0, sfx = s_knownSfx; i < s_numSfx; i++, sfx++ )
 	{
@@ -399,7 +512,7 @@ void S_InitSounds( void )
 	s_numSfx = 1;
 }
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 /*
 =================
 S_PurgeSoundData

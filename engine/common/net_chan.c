@@ -127,7 +127,7 @@ qboolean NetSplit_GetLong( netsplit_t *ns, netadr_t *from, byte *data, size_t *l
 	//ASSERT( *length > NETSPLIT_HEADER_SIZE );
 	if( *length <= NETSPLIT_HEADER_SIZE ) return false;
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	if( !ns->packets )
 		ns->packets = Mem_Calloc( net_mempool, sizeof( netsplit_chain_packet_t ) * NETSPLIT_BACKUP );
 #endif
@@ -309,7 +309,7 @@ called to open a channel to a remote system
 */
 void Netchan_Setup( netsrc_t sock, netchan_t *chan, netadr_t adr, int qport, void *client, int (*pfnBlockSize)(void *, fragsize_t mode ))
 {
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	// the buffers survive the wipe below, a reused channel keeps its own
 	byte			*bufs = chan->message_buf;
 	netsplit_chain_packet_t	*split = chan->netsplit.packets;
@@ -319,7 +319,7 @@ void Netchan_Setup( netsrc_t sock, netchan_t *chan, netadr_t adr, int qport, voi
 
 	memset( chan, 0, sizeof( *chan ));
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	if( !bufs )
 		bufs = Mem_Malloc( net_mempool, NET_MAX_MESSAGE * 2 );
 	chan->message_buf = bufs;
@@ -341,14 +341,14 @@ void Netchan_Setup( netsrc_t sock, netchan_t *chan, netadr_t adr, int qport, voi
 	chan->client = client;
 	chan->pfnBlockSize = pfnBlockSize;
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	MSG_Init( &chan->message, "NetData", chan->message_buf, NET_MAX_MESSAGE );
 #else
 	MSG_Init( &chan->message, "NetData", chan->message_buf, sizeof( chan->message_buf ));
 #endif
 }
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 /*
 ==============
 Netchan_FreeBuffers
@@ -1608,7 +1608,7 @@ void Netchan_TransmitBits( netchan_t *chan, int length, byte *data )
 				}
 
 				// copy frag stuff on top of current buffer
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 				MSG_StartWriting( &temp, chan->reliable_buf, NET_MAX_MESSAGE, chan->reliable_length, -1 );
 #else
 				MSG_StartWriting( &temp, chan->reliable_buf, sizeof( chan->reliable_buf ), chan->reliable_length, -1 );

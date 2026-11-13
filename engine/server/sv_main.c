@@ -16,6 +16,7 @@ GNU General Public License for more details.
 #include "common.h"
 #include "server.h"
 #include "net_encode.h"
+#include "ps2_perf.h"
 
 #define HEARTBEAT_SECONDS	300.0f 		// 300 seconds
 
@@ -611,6 +612,13 @@ Host_ServerFrame
 */
 void Host_ServerFrame( void )
 {
+	#if XASH_PS2
+	static int ps2_spawned_frames = 0;
+	qboolean ps2_trace = (svs.initialized && svs.clients &&
+		svs.clients[0].state == cs_spawned && ps2_spawned_frames++ < 6);
+	if( ps2_trace )
+		printf( "[XASH-PS2] STAGE=SV_SPAWNED_FRAME_ENTER tick=%d\n", ps2_spawned_frames );
+	#endif
 	// if server is not active, do nothing
 	if( !svs.initialized ) return;
 
@@ -626,6 +634,9 @@ void Host_ServerFrame( void )
 
 	// read packets from clients
 	SV_ReadPackets ();
+	#if XASH_PS2
+	if( ps2_trace ) printf( "[XASH-PS2] STAGE=SV_SPAWNED_PACKETS_DONE\n" );
+	#endif
 
 	// refresh physic movevars on the client side
 	SV_UpdateMovevars ( false );
@@ -638,9 +649,19 @@ void Host_ServerFrame( void )
 
 	// let everything in the world think and move
 	if( !SV_RunGameFrame ()) return;
+	#if XASH_PS2
+	if( ps2_trace ) printf( "[XASH-PS2] STAGE=SV_SPAWNED_SIM_DONE\n" );
+	#endif
 		
 	// send messages back to the clients that had packets read this frame
-	SV_SendClientMessages ();
+	{
+		PS2_PERF_BEGIN( SVSEND );
+		SV_SendClientMessages ();
+		PS2_PERF_END( SVSEND );
+	}
+	#if XASH_PS2
+	if( ps2_trace ) printf( "[XASH-PS2] STAGE=SV_SPAWNED_SEND_DONE\n" );
+	#endif
 
 	// clear edict flags for next frame
 	SV_PrepWorldFrame ();
@@ -1015,7 +1036,7 @@ void SV_FreeClients( void )
 		// free server static data
 		if( svs.clients )
 		{
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 			int	i;
 
 			for( i = 0; i < svs.maxclients; i++ )
@@ -1067,7 +1088,7 @@ void SV_Shutdown( const char *finalmsg )
 		Master_Shutdown();
 
 	NET_Config( false );
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	// The game library is linked into the executable and can't really be
 	// unloaded: its globals survive while SV_UnloadProgs wipes everything
 	// the engine knew about it (messages, cvars, callbacks), and the next
@@ -1082,6 +1103,7 @@ void SV_Shutdown( const char *finalmsg )
 	CL_Drop();
 
 	// free current level
+	SV_FreeResources();
 	memset( &sv, 0, sizeof( sv ));
 
 	SV_FreeClients();
@@ -1094,6 +1116,13 @@ void SV_Shutdown( const char *finalmsg )
 	{
 		void PSP_LogHeapUsage( const char *when );
 		PSP_LogHeapUsage( "after disconnect" );
+	}
+#elif XASH_PS2
+	{
+		// the game library stays loaded, so only its 2 edict blocks stay live:
+		// anything more pins the arena
+		void PS2_Arena_Report( const char *when );
+		PS2_Arena_Report( "after_shutdown" );
 	}
 #endif
 

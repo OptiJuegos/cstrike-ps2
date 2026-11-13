@@ -43,6 +43,9 @@ void R_DrawSurfaceBlock8_mip2 (void);
 void R_DrawSurfaceBlock8_mip3 (void);
 void R_DrawSurfaceBlock8_Generic (void);
 void R_DrawSurfaceBlock8_World (void);
+#if XASH_PS2
+static void R_DrawSurfaceBlock8_PS2Wrapped( void );
+#endif
 
 static float worldlux_s, worldlux_t;
 
@@ -180,7 +183,7 @@ static void R_BuildLightMap( void )
 	int		sample_size;
 	msurface_t *surf = r_drawsurf.surf;
 	mextrasurf_t	*info = surf->info;
-	color24		*lm;
+	lightsample_t	*lm;
 	qboolean dynamic = 0;
 
 	sample_size = gEngfuncs.Mod_SampleSizeForFace( surf );
@@ -211,9 +214,13 @@ static void R_BuildLightMap( void )
 
 		for( i = 0, bl = blocklights; i < size; i++, bl += 1, lm++ )
 		{
+#if XASH_PS2
+			bl[0] += gEngfuncs.LightToTexGamma( *lm ) * scale * 3;
+#else
 			bl[0] += gEngfuncs.LightToTexGamma( lm->r ) * scale;
 			bl[0] += gEngfuncs.LightToTexGamma( lm->g ) * scale;
 			bl[0] += gEngfuncs.LightToTexGamma( lm->b ) * scale;
+#endif
 
 			//printf("test\n");
 			//bl[1] += gEngfuncs.LightToTexGamma( lm->g ) * scale;
@@ -515,7 +522,7 @@ void R_DrawSurface (void)
 // the fractional light values should range from 0 to (VID_GRADES - 1) << 16
 // from a source range of 0 - 255
 	
-	texwidth = mt->width >> r_drawsurf.surfmip;
+	texwidth = Q_max( 1, mt->width >> r_drawsurf.surfmip );
 
 	blocksize = sample_pot >> r_drawsurf.surfmip;
 	blockdivshift = sample_bits - r_drawsurf.surfmip;
@@ -540,9 +547,9 @@ void R_DrawSurface (void)
 // TODO: only needs to be set when there is a display settings change
 	horzblockstep = blocksize;
 
-	smax = mt->width >> r_drawsurf.surfmip;
+	smax = texwidth;
 	twidth = texwidth;
-	tmax = mt->height >> r_drawsurf.surfmip;
+	tmax = Q_max( 1, mt->height >> r_drawsurf.surfmip );
 	sourcetstep = texwidth;
 	r_stepback = tmax * twidth;
 
@@ -581,7 +588,7 @@ void R_DrawSurface (void)
 
 			soffset = soffset + blocksize;
 			if (soffset >= smax)
-				soffset = 0;
+				soffset %= smax;
 
 			pcolumndest += horzblockstep;
 		}
@@ -606,11 +613,20 @@ void R_DrawSurface (void)
 
 		pbasesource = basetptr + soffset;
 
-		(*pblockdrawer)();
+		#if XASH_PS2
+		/* Downsampling 128x240 walls to 32x60 creates mipmaps whose
+		 * rows do not fit whole lightmap blocks. Wrap only these tiles. */
+		if( blocksize > 0 && ((smax % blocksize) || (tmax % blocksize) ||
+			(soffset % blocksize) ||
+			(((basetptr - r_source) / twidth) % blocksize)))
+			R_DrawSurfaceBlock8_PS2Wrapped();
+		else
+		#endif
+			(*pblockdrawer)();
 
 		soffset = soffset + blocksize;
 		if (soffset >= smax)
-			soffset = 0;
+			soffset %= smax;
 
 		pcolumndest += horzblockstep;
 	}
@@ -623,6 +639,51 @@ void R_DrawSurface (void)
 
 #if	!id386
 #define BLEND_LM(pix, light) vid.colormap[(pix >> 3) | ((light & 0x1f00) << 5)] | ( pix & 7 );
+
+#if XASH_PS2
+/* The original drawers wrap at the end of a whole lightmap block. A
+ * downscaled texture whose width/height is not divisible by that block
+ * needs wrapping for each texel instead. Called only for those tiles. */
+static void R_DrawSurfaceBlock8_PS2Wrapped( void )
+{
+	const int texwidth = (int)sourcetstep;
+	const int texheight = r_stepback / texwidth;
+	const int sourceindex = (int)(pbasesource - r_source);
+	const int startx = sourceindex % texwidth;
+	const int shift = 4 - r_drawsurf.surfmip;
+	pixel_t *dest = prowdestbase;
+	int y = sourceindex / texwidth;
+	int v, i, b;
+
+	for( v = 0; v < r_numvblocks; v++ )
+	{
+		uint left = r_lightptr[0], right = r_lightptr[1];
+		uint leftstep, rightstep;
+		r_lightptr += r_lightwidth;
+		leftstep = (r_lightptr[0] - left) >> shift;
+		rightstep = (r_lightptr[1] - right) >> shift;
+		for( i = 0; i < blocksize; i++ )
+		{
+			uint lightstep = (left - right) >> shift;
+			uint light = right;
+			const pixel_t *source = r_source + y * texwidth;
+			for( b = blocksize - 1; b >= 0; b-- )
+			{
+				int x = startx + b;
+				pixel_t pix;
+				if( x >= texwidth ) x %= texwidth;
+				pix = source[x];
+				dest[b] = pix == TRANSPARENT_COLOR ? pix : BLEND_LM( pix, light );
+				light += lightstep;
+			}
+			if( ++y >= texheight ) y = 0;
+			left += leftstep;
+			right += rightstep;
+			dest += surfrowbytes;
+		}
+	}
+}
+#endif
 
 /*
 ================
@@ -971,11 +1032,18 @@ void R_InitCaches (void)
 	}
 	else
 	{
+		#if XASH_PS2
+			// Surface cache is an evicting, regenerated 16-bit scratch buffer:
+			// reducing it cannot drop map surfaces or alter source lightmaps.
+			// Reserve EE RAM for the original HUD and Studio textures instead.
+			size = 192 * 1024;
+		#else
 		size = SURFCACHE_SIZE_AT_320X240 * 2;
 
 		pix = vid.width * vid.height * 2;
 		if (pix > 64000)
 			size += (pix-64000)*3;
+		#endif
 	}		
 
 	// round up to page size
@@ -1365,7 +1433,7 @@ surfcache_t *D_CacheSurface (msurface_t *surface, int miplevel)
 //
 // determine shape of surface
 //
-	surfscale = 1.0 / (1<<miplevel);
+	surfscale = 1.0f / (float)(1<<miplevel);
 	r_drawsurf.surfmip = miplevel;
 	if( surface->flags & SURF_CONVEYOR )
 		r_drawsurf.surfwidth = surface->extents[0] >> miplevel;

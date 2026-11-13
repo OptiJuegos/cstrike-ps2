@@ -1116,7 +1116,7 @@ void *COM_FunctionFromName( void *hInstance, const char *pName )
 		if( !Q_strcmp( pName, hInst->names[i] ))
 		{
 			index = hInst->ordinals[i];
-			return hInst->funcs[index] + hInst->funcBase;
+			return (void *)(size_t)( hInst->funcs[index] + hInst->funcBase );
 		}
 	}
 

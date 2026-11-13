@@ -40,6 +40,11 @@ GNU General Public License for more details.
 #include "library.h"
 #include "xash3d_mathlib.h"
 #include "protocol.h"
+#if XASH_PS2
+#include "fs_paths_ps2.h"
+#include "ps2_fastpak.h"
+#include "ps2_path_cache.h"
+#endif
 
 #define FILE_COPY_SIZE		(1024 * 1024)
 #define FILE_BUFF_SIZE		(2048)
@@ -88,6 +93,9 @@ typedef struct wadtype_s
 
 struct file_s
 {
+#if XASH_PS2
+	CSFastPakFile *fastpak;
+#endif
 #if XASH_PSP
 	SceUID	handle;			// psp file descriptor
 #else
@@ -126,10 +134,17 @@ struct wfile_s
 	file_t		*handle;
 	dlumpinfo_t	*lumps;
 	time_t		filetime;
+#if XASH_PS2
+	qboolean		ps2_broken;	// lazy open failed, don't retry
+	qboolean		ps2_ext_path;	// fs_ext_path when mounted: a folder wad, not one inside a pak
+#endif
 };
 
 typedef struct pack_s
 {
+#if XASH_PS2
+	CSFastPak *fastpak;
+#endif
 	string		filename;
 #if XASH_PSP
 	SceUID	handle;
@@ -140,6 +155,17 @@ typedef struct pack_s
 	time_t		filetime;			// common for all packed files
 	dpackfile_t	*files;
 } pack_t;
+
+/* Fast archives own their directory; keep one index rather than a second
+ * dpackfile_t array. Enumeration still feeds WAD discovery and FS_Search. */
+static const char *FS_PackName( const pack_t *pack, int index )
+{
+#if XASH_PS2
+	if( pack->fastpak )
+		return cs_fastpak_name_at( pack->fastpak, index, NULL );
+#endif
+	return pack->files[index].name;
+}
 
 #ifndef XASH_NO_ZIP
 typedef struct zipfile_s
@@ -179,6 +205,12 @@ typedef struct searchpath_s
 
 static byte			*fs_mempool;
 static searchpath_t		*fs_searchpaths = NULL;	// chain
+#if XASH_PS2
+static CSPathCache fs_archive_paths;
+#define FS_InvalidateArchivePaths() cs_path_cache_clear( &fs_archive_paths )
+#else
+#define FS_InvalidateArchivePaths() ((void)0)
+#endif
 static searchpath_t		fs_directpath;		// static direct path
 static char			fs_basedir[MAX_SYSPATH];	// base game directory
 static char			fs_gamedir[MAX_SYSPATH];	// game current directory
@@ -285,7 +317,13 @@ static void FS_EnsureOpenFile( file_t *file )
 	fs_last_readfile = file;
 	if( file && (file->handle == -1) )
 	{
+#if XASH_PS2
+		char path[MAX_SYSPATH];
+		file->handle = PS2_FS_MakePath( file->backup_path, path, sizeof( path )) ?
+			open( path, file->backup_options ) : -1;
+#else
 		file->handle = open( file->backup_path, file->backup_options );
+#endif
 		lseek( file->handle, file->backup_position, SEEK_SET );
 	}
 #endif
@@ -313,7 +351,15 @@ static void FS_EnsureOpenZip( zip_t *zip )
 	}
 	fs_last_zip = zip;
 	if( zip && (zip->handle == -1) )
+	{
+#if XASH_PS2
+		char path[MAX_SYSPATH];
+		zip->handle = PS2_FS_MakePath( zip->filename, path, sizeof( path )) ?
+			open( path, O_RDONLY ) : -1;
+#else
 		zip->handle = open( zip->filename, O_RDONLY|O_BINARY );
+#endif
+	}
 #endif
 }
 #endif // XASH_NO_ZIP
@@ -356,6 +402,9 @@ void Zip_Close( zip_t *zip );
 #endif
 static byte *W_LoadFile( const char *path, fs_offset_t *filesizeptr, qboolean gamedironly );
 static wfile_t *W_Open( const char *filename, int *errorcode );
+#if XASH_PS2
+static qboolean W_PS2Ensure( wfile_t *wad );
+#endif
 static qboolean FS_SysFolderExists( const char *path );
 static int FS_SysFileTime( const char *filename );
 static signed char W_TypeFromExt( const char *lumpname );
@@ -445,10 +494,166 @@ static void listlowercase( stringlist_t *list )
 	}
 }
 
+#if XASH_PS2
+/*
+ * On a real console (rom0:FILEIO + usbhdfsd) open() and stat() hang on a USB
+ * folder, and opendir() may hang on a file. Only opendir() on folders and
+ * open() on files are safe. readdir() already reports d_type, so remember
+ * each listed entry's type and answer folder checks from it.
+ * shortcut: 32-bit name hashes, a collision could misreport a type; store
+ * full paths if that ever shows up.
+ */
+#define PS2_DIRTYPE_SLOTS 256
+static struct { uint hash; signed char isdir; } ps2_dirtypes[PS2_DIRTYPE_SLOTS];
+static int ps2_dirtypes_next;
+
+static uint PS2_PathHash( const char *hostpath )
+{
+	uint hash = 2166136261u;
+	size_t len = Q_strlen( hostpath );
+	while( len > 1 && hostpath[len - 1] == '/' && hostpath[len - 2] != ':' )
+		len--; // "valve/" and "valve" are the same entry
+	while( len-- )
+		hash = ( hash ^ (byte)Q_tolower( *hostpath++ )) * 16777619u;
+	return hash;
+}
+
+// -1 unknown, 0 file, 1 folder
+static int PS2_KnownType( const char *hostpath )
+{
+	uint hash = PS2_PathHash( hostpath );
+	int i;
+	for( i = 0; i < PS2_DIRTYPE_SLOTS; i++ )
+		if( ps2_dirtypes[i].isdir >= 0 && ps2_dirtypes[i].hash == hash && hash )
+			return ps2_dirtypes[i].isdir;
+	return -1;
+}
+
+static void PS2_RememberType( const char *relpath, const char *name, int isdir )
+{
+	char hostpath[MAX_SYSPATH], joined[MAX_SYSPATH];
+	size_t len = Q_strlen( relpath );
+	uint hash;
+	int i;
+	if( !Q_strcmp( name, "." ) || !Q_strcmp( name, ".." ))
+		return;
+	// not va(): it runs once per entry, and its ring of buffers would
+	// overwrite the caller's path, itself often a va() result
+	Q_snprintf( joined, sizeof( joined ), "%s%s%s", relpath, !len || relpath[len - 1] == '/' ? "" : "/", name );
+	if( !PS2_FS_MakePath( joined, hostpath, sizeof( hostpath )))
+		return;
+	hash = PS2_PathHash( hostpath );
+	for( i = 0; i < PS2_DIRTYPE_SLOTS; i++ )
+	{
+		if( ps2_dirtypes[i].isdir >= 0 && ps2_dirtypes[i].hash == hash )
+		{
+			ps2_dirtypes[i].isdir = isdir;
+			return;
+		}
+	}
+	ps2_dirtypes[ps2_dirtypes_next].hash = hash;
+	ps2_dirtypes[ps2_dirtypes_next].isdir = isdir;
+	ps2_dirtypes_next = ( ps2_dirtypes_next + 1 ) % PS2_DIRTYPE_SLOTS;
+}
+
+/*
+ * cdrom0: cannot list folders, so tools/make_ps2_iso.py writes every disc
+ * folder's names into its dirlist.txt: one per line, folders end with '/'.
+ */
+#define PS2_DISC_LISTED_MAX 16
+static uint ps2_disc_listed[PS2_DISC_LISTED_MAX]; // PS2_PathHash of folders read from dirlist.txt
+static int ps2_disc_listed_count;
+
+/*
+ * Whether a disc file exists, without the drive when possible: 1 yes, 0 no,
+ * -1 ask the drive (its folder is on the disc but was not listed yet).
+ */
+static int PS2_DiscFileExists( const char *hostpath )
+{
+	char	parent[MAX_SYSPATH];
+	char	*slash;
+	uint	hash;
+	int	i;
+
+	Q_strncpy( parent, hostpath, sizeof( parent ));
+	slash = Q_strrchr( parent, '/' );
+	if( !slash ) slash = Q_strchr( parent, ':' );
+	if( !slash ) return -1;
+	slash[1] = 0;
+	if( slash[0] == ':' ) Q_strncat( parent, ".", sizeof( parent )); // disc root is "cdrom0:."
+	hash = PS2_PathHash( parent );
+	for( i = 0; i < ps2_disc_listed_count; i++ )
+		if( ps2_disc_listed[i] == hash )
+			return PS2_KnownType( hostpath ) == 0;
+	if( slash[0] == ':' )
+		return -1; // root not listed yet
+	// folders the disc has were named by their parent's listing
+	return PS2_KnownType( parent ) == 1 ? -1 : 0;
+}
+
+static void PS2_ListDiscDirectory( stringlist_t *list, const char *relpath, const char *hostpath )
+{
+	char	listpath[MAX_SYSPATH], text[4096], *line, *next;
+	size_t	len = Q_strlen( hostpath );
+	int	fd, size, isdir;
+
+	if( ps2_disc_listed_count < PS2_DISC_LISTED_MAX )
+		ps2_disc_listed[ps2_disc_listed_count++] = PS2_PathHash( hostpath );
+
+	if( len >= 2 && hostpath[len - 1] == '.' && hostpath[len - 2] == ':' )
+		len--; // disc root is "cdrom0:."
+	Q_snprintf( listpath, sizeof( listpath ), "%.*s%sdirlist.txt", (int)len, hostpath,
+		len && ( hostpath[len - 1] == '/' || hostpath[len - 1] == ':' ) ? "" : "/" );
+	if(( fd = open( listpath, O_RDONLY )) < 0 )
+	{
+		printf( "[XASH-PS2] FS_LIST_FAILED %s (no dirlist.txt)\n", hostpath );
+		return;
+	}
+	size = read( fd, text, sizeof( text ) - 1 );
+	close( fd );
+	if( size <= 0 ) return;
+	text[size] = 0;
+
+	for( line = text; *line; line = next )
+	{
+		next = line + strcspn( line, "\r\n" );
+		if( *next ) *next++ = 0;
+		while( *next == '\r' || *next == '\n' ) next++;
+		if( !*line ) continue;
+
+		len = Q_strlen( line );
+		isdir = line[len - 1] == '/';
+		if( isdir ) line[len - 1] = 0;
+		stringlistappend( list, line );
+		PS2_RememberType( relpath, line, isdir );
+	}
+	printf( "[XASH-PS2] FS_LIST_READ entries=%d (dirlist.txt)\n", list->numstrings );
+}
+#endif
+
 static void listdirectory( stringlist_t *list, const char *path, qboolean lowercase )
 {
 	int		i;
 	signed char *c;
+#if XASH_PS2
+	char hostpath[MAX_SYSPATH];
+	const char *relpath = path;
+	if( !PS2_FS_MakePath( path, hostpath, sizeof( hostpath )))
+	{
+		printf( "[XASH-PS2] FS_BAD_DIR %s\n", path );
+		return;
+	}
+	path = hostpath;
+	printf( "[XASH-PS2] FS_LIST %s\n", path );
+	if( !Q_strncmp( hostpath, "cdrom", 5 ))
+	{
+		PS2_ListDiscDirectory( list, relpath, hostpath );
+		return;
+	}
+	// FS_Search lists paths like "valve/decals.wad/"; never opendir() a known file
+	if( PS2_KnownType( hostpath ) == 0 )
+		return;
+#endif
 #if XASH_WIN32
 	char pattern[4096];
 	struct _finddata_t	n_file;
@@ -489,12 +694,29 @@ static void listdirectory( stringlist_t *list, const char *path, qboolean lowerc
 	}
 	sceIoDclose( dir );
 #else
-	if( !( dir = opendir( path ) ) )
+		if( !( dir = opendir( path ) ) )
+		{
+		#if XASH_PS2
+			printf( "[XASH-PS2] FS_LIST_FAILED %s errno=%d\n", path, errno );
+		#endif
 		return;
+		}
 
+	#if XASH_PS2
+	printf( "[XASH-PS2] FS_LIST_OPEN\n" );
+	#endif
 	// iterate through the directory
 	while( ( entry = readdir( dir ) ))
+	{
 		stringlistappend( list, entry->d_name );
+	#if XASH_PS2
+		if( entry->d_type == DT_DIR || entry->d_type == DT_REG )
+			PS2_RememberType( relpath, entry->d_name, entry->d_type == DT_DIR );
+	#endif
+	}
+	#if XASH_PS2
+	printf( "[XASH-PS2] FS_LIST_READ entries=%d\n", list->numstrings );
+	#endif
 	closedir( dir );
 #endif
 
@@ -550,7 +772,7 @@ static const char *FS_FixFileCase( const char *path )
 
 	out[i] = 0;
 	return out;
-#elif !XASH_WIN32 && !XASH_IOS && !XASH_PSP // assume case insensitive
+#elif !XASH_WIN32 && !XASH_IOS && !XASH_PSP && !XASH_PS2 // assume case insensitive
 	DIR *dir; struct dirent *entry;
 	char path2[PATH_MAX], *fname;
 
@@ -660,6 +882,9 @@ Only used for FS_Open.
 */
 void FS_CreatePath( char *path )
 {
+#if XASH_PS2
+	return; // asset installation is read-only
+#endif
 	char	*ofs, save;
 
 	for( ofs = path + 1; *ofs; ofs++ )
@@ -732,6 +957,9 @@ of the list so they override previous pack files.
 pack_t *FS_LoadPackPAK( const char *packfile, int *error )
 {
 	dpackheader_t	header;
+#if XASH_PS2
+	char ps2_packpath[MAX_SYSPATH];
+#endif
 #if XASH_PSP
 	SceUID	packhandle;
 #else
@@ -740,12 +968,34 @@ pack_t *FS_LoadPackPAK( const char *packfile, int *error )
 	int		i, numpackfiles;
 	pack_t		*pack;
 	dpackfile_t	*info;
-#if XASH_PSP
+#if XASH_PS2
+	/* Resolve once at mount, then retain the physical path, directory and
+	 * descriptor for the searchpath lifetime. Never reopen for each asset. */
+	CSFastPak *fastpak = NULL;
+	if( PS2_FS_MakePath( packfile, ps2_packpath, sizeof( ps2_packpath )))
+		fastpak = cs_fastpak_mount( ps2_packpath );
+	if( fastpak )
+	{
+		pack = (pack_t *)Mem_Calloc( fs_mempool, sizeof( *pack ));
+		Q_strncpy( pack->filename, packfile, sizeof( pack->filename ));
+		pack->handle = -1;
+		pack->fastpak = fastpak;
+		pack->numfiles = cs_fastpak_entry_count( fastpak );
+		pack->filetime = FS_SysFileTime( packfile );
+		Con_Reportf( "PS2 fastpak: %s (%i files, cached path/index)\n",
+			cs_fastpak_path( fastpak ), pack->numfiles );
+		if( error ) *error = PAK_LOAD_OK;
+		return pack;
+	}
+	/* Keep the existing PACK reader as a compatibility fallback. */
+	packhandle = PS2_FS_MakePath( packfile, ps2_packpath, sizeof( ps2_packpath )) ?
+		open( ps2_packpath, O_RDONLY ) : -1;
+#elif XASH_PSP
 	packhandle = sceIoOpen( packfile, PSP_O_RDONLY, 0666 );
 #else
 	packhandle = open( packfile, O_RDONLY|O_BINARY );
 #endif
-#if !XASH_WIN32 && !XASH_PSP
+#if !XASH_WIN32 && !XASH_PSP && !XASH_PS2
 	if( packhandle < 0 )
 	{
 		const char *fpackfile = FS_FixFileCase( packfile );
@@ -878,10 +1128,16 @@ static zip_t *FS_LoadZip( const char *zipfile, int *error )
 	zip_t *zip = (zip_t *)Mem_Calloc( fs_mempool, sizeof( zip_t ) );
 #if XASH_PSP
 	zip->handle = sceIoOpen( zipfile, PSP_O_RDONLY, 0666 );
+#elif XASH_PS2
+	{
+		char path[MAX_SYSPATH];
+		zip->handle = PS2_FS_MakePath( zipfile, path, sizeof( path )) ?
+			open( path, O_RDONLY ) : -1;
+	}
 #else
 	zip->handle = open( zipfile, O_RDONLY|O_BINARY );
 #endif
-#if !XASH_WIN32 && !XASH_PSP
+#if !XASH_WIN32 && !XASH_PSP && !XASH_PS2
 	if( zip->handle < 0 )
 	{
 		const char *fzipfile = FS_FixFileCase( zipfile );
@@ -1260,8 +1516,19 @@ static qboolean FS_AddWad_Fullpath( const char *wadfile, qboolean *already_loade
 	if( already_loaded )
 		*already_loaded = false;
 
+#if XASH_PS2
+	// mounted unopened: the lump table and file handle come on first use
+	// (W_PS2Ensure) and go again after each map load (FS_PS2ReleaseWads)
+	if( !Q_stricmp( ext, "wad" ))
+	{
+		wad = (wfile_t *)Mem_Calloc( fs_mempool, sizeof( wfile_t ));
+		Q_strncpy( wad->filename, wadfile, sizeof( wad->filename ));
+		wad->ps2_ext_path = fs_ext_path;
+	}
+#else
 	if( !Q_stricmp( ext, "wad" ))
 		wad = W_Open( wadfile, &errorcode );
+#endif
 
 	if( wad )
 	{
@@ -1269,6 +1536,7 @@ static qboolean FS_AddWad_Fullpath( const char *wadfile, qboolean *already_loade
 		search->wad = wad;
 		search->next = fs_searchpaths;
 		search->flags |= flags;
+		FS_InvalidateArchivePaths();
 		fs_searchpaths = search;
 
 		Con_Reportf( "Adding wadfile: %s (%i files)\n", wadfile, wad->numlumps );
@@ -1326,6 +1594,7 @@ static qboolean FS_AddPak_Fullpath( const char *pakfile, qboolean *already_loade
 		search->pack = pak;
 		search->next = fs_searchpaths;
 		search->flags |= flags;
+		FS_InvalidateArchivePaths();
 		fs_searchpaths = search;
 
 		Con_Reportf( "Adding pakfile: %s (%i files)\n", pakfile, pak->numfiles );
@@ -1333,9 +1602,9 @@ static qboolean FS_AddPak_Fullpath( const char *pakfile, qboolean *already_loade
 		// time to add in search list all the wads that contains in current pakfile (if do)
 		for( i = 0; i < pak->numfiles; i++ )
 		{
-			if( !Q_stricmp( COM_FileExtension( pak->files[i].name ), "wad" ))
+			if( !Q_stricmp( COM_FileExtension( FS_PackName( pak, i )), "wad" ))
 			{
-				Q_snprintf( fullpath, MAX_STRING, "%s/%s", pakfile, pak->files[i].name );
+				Q_snprintf( fullpath, MAX_STRING, "%s/%s", pakfile, FS_PackName( pak, i ));
 				FS_AddWad_Fullpath( fullpath, NULL, flags );
 			}
 		}
@@ -1381,6 +1650,7 @@ qboolean FS_AddZip_Fullpath( const char *zipfile, qboolean *already_loaded, int 
 		search->zip = zip;
 		search->next = fs_searchpaths;
 		search->flags |= flags;
+		FS_InvalidateArchivePaths();
 		fs_searchpaths = search;
 
 		Con_Reportf( "Adding zipfile: %s (%i files)\n", zipfile, zip->numfiles );
@@ -1426,6 +1696,18 @@ void FS_AddGameDirectory( const char *dir, uint flags )
 	listdirectory( &list, dir, false );
 	stringlistsort( &list );
 
+#if XASH_PS2
+	// PS2: packages go before loose files, as in Geometry Dash PS2. Each
+	// lookup that misses a loose folder costs one host:/USB round trip,
+	// and nearly every asset lives in a package. Loose files stay a fallback.
+	search = (searchpath_t *)Mem_Calloc( fs_mempool, sizeof( searchpath_t ));
+	Q_strncpy( search->filename, dir, sizeof ( search->filename ));
+	search->next = fs_searchpaths;
+	search->flags = flags;
+	FS_InvalidateArchivePaths();
+	fs_searchpaths = search;
+#endif
+
 	// add any PAK package in the directory
 	for( i = 0; i < list.numstrings; i++ )
 	{
@@ -1463,13 +1745,16 @@ void FS_AddGameDirectory( const char *dir, uint flags )
 	stringlistfreecontents( &list );
 	FS_AllowDirectPaths( false );
 
+#if !XASH_PS2
 	// add the directory to the search path
 	// (unpacked files have the priority over packed files)
 	search = (searchpath_t *)Mem_Calloc( fs_mempool, sizeof( searchpath_t ));
 	Q_strncpy( search->filename, dir, sizeof ( search->filename ));
 	search->next = fs_searchpaths;
 	search->flags = flags;
+	FS_InvalidateArchivePaths();
 	fs_searchpaths = search;
+#endif
 }
 
 /*
@@ -1516,12 +1801,12 @@ void FS_AddGameHierarchy( const char *dir, uint flags )
 		FS_AddGameDirectory( va( "%s/%s/", host.rodir, dir ), newFlags );
 		FS_AllowDirectPaths( false );
 	}
-#if !XASH_PSP
+#if !XASH_PSP && !XASH_PS2 // PS2: read-only install, each missing dir costs a failed open per asset
 	if( isGameDir )
 		FS_AddGameDirectory( va( "%s/downloaded/", dir ), FS_NOWRITE_PATH | FS_CUSTOM_PATH );
 #endif
 	FS_AddGameDirectory( va( "%s/", dir ), flags );
-#if !XASH_PSP
+#if !XASH_PSP && !XASH_PS2
 	if( isGameDir )
 		FS_AddGameDirectory( va( "%s/custom/", dir ), FS_NOWRITE_PATH | FS_CUSTOM_PATH );
 #endif
@@ -1534,6 +1819,7 @@ FS_ClearSearchPath
 */
 void FS_ClearSearchPath( void )
 {
+	FS_InvalidateArchivePaths();
 	while( fs_searchpaths )
 	{
 		searchpath_t	*search = fs_searchpaths;
@@ -1551,6 +1837,9 @@ void FS_ClearSearchPath( void )
 
 		if( search->pack )
 		{
+#if XASH_PS2
+			cs_fastpak_unmount( search->pack->fastpak );
+#endif
 			if( search->pack->files )
 				Mem_Free( search->pack->files );
 #if XASH_PSP
@@ -1796,7 +2085,7 @@ void FS_InitGameInfo( gameinfo_t *GameInfo, const char *gamedir )
 	// shared assets always live in the base game folder, whatever the game is
 	Q_strncpy( GameInfo->basedir, "valve", sizeof( GameInfo->basedir ));
 	GameInfo->falldir[0] = 0;
-#if XASH_PSP
+	#if XASH_PSP || XASH_PS2
 	// Counter-Strike ships its own start/train maps and titles
 	Q_strncpy( GameInfo->startmap, "de_dust2", sizeof( GameInfo->startmap ));
 	Q_strncpy( GameInfo->trainmap, "de_dust2", sizeof( GameInfo->trainmap ));
@@ -1822,15 +2111,34 @@ void FS_InitGameInfo( gameinfo_t *GameInfo, const char *gamedir )
 	Q_strncpy( GameInfo->sp_entity, "info_player_start", sizeof( GameInfo->sp_entity ));
 	Q_strncpy( GameInfo->mp_entity, "info_player_deathmatch", sizeof( GameInfo->mp_entity ));
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	// also what a gameinfo.txt regenerated from liblist.gam gets: the PC
-	// defaults below take several MB the PSP doesn't have
-	GameInfo->max_edicts     = 600;
+	// defaults below take several MB the PSP/PS2 memory budgets don't have.
+	// Keep the original temporary-entity and particle systems, but use their
+	// smaller console limits so they don't reserve MBs while still in MainUI.
+		#if XASH_PS2
+		// Largest stock map: de_vertigo, 272 entities in the BSP. 14 players
+		// with up to 6 weapons each and their drops take ~130 more; running
+		// out is a Host_Error, so keep ~50 spare. Each slot costs ~2.8 KB
+		// (client, server, baseline); gameinfo can still request more.
+		GameInfo->max_edicts     = 448;
+		#else
+		GameInfo->max_edicts     = 600;
+		#endif
 	GameInfo->max_tents      = 150;
 	GameInfo->max_beams      = 64;
 	GameInfo->max_particles  = 512;
+	#if XASH_PS2
+	// Each TEMPENTITY includes a complete cl_entity_t (~3 KiB). Keep a
+	// 100-slot pool by default on the PS2; gameinfo.txt can still raise it.
+	GameInfo->max_tents = 100;
+	#endif
 #else
 	GameInfo->max_edicts     = 900; // default value if not specified
+	#if XASH_DEDICATED && XASH_LOW_MEMORY >= 2
+	// clients size their entity array from the server's count: match the PS2 (448)
+	GameInfo->max_edicts     = 448;
+	#endif
 	GameInfo->max_tents      = 500;
 	GameInfo->max_beams      = 128;
 	GameInfo->max_particles  = 4096;
@@ -2010,7 +2318,7 @@ void FS_ParseGenericGameInfo( gameinfo_t *GameInfo, const char *buf, const qbool
 			else if( !Q_stricmp( token, "max_tempents" ))
 			{
 				pfile = COM_ParseFile( pfile, token );
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 				// each one holds a whole client entity, gameinfo.txt can go lower
 				GameInfo->max_tents = bound( 100, Q_atoi( token ), 2048 );
 #else
@@ -2025,7 +2333,7 @@ void FS_ParseGenericGameInfo( gameinfo_t *GameInfo, const char *buf, const qbool
 			else if( !Q_stricmp( token, "max_particles" ))
 			{
 				pfile = COM_ParseFile( pfile, token );
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 				GameInfo->max_particles = bound( 256, Q_atoi( token ), 32768 );
 #else
 				GameInfo->max_particles = bound( 4096, Q_atoi( token ), 32768 );
@@ -2109,10 +2417,16 @@ static qboolean FS_ParseLiblistGam( const char *filename, const char *gamedir, g
 	if( !GameInfo ) return false;
 	afile = (char *)FS_LoadFile( filename, NULL, false );
 	if( !afile ) return false;
+#if XASH_PS2
+	printf( "[XASH-PS2] LIBLIST loaded %s\n", filename );
+#endif
 
 	FS_InitGameInfo( GameInfo, gamedir );
 
 	FS_ParseGenericGameInfo( GameInfo, afile, false );
+#if XASH_PS2
+	printf( "[XASH-PS2] LIBLIST parsed\n" );
+#endif
 
 	Mem_Free( afile );
 
@@ -2201,6 +2515,24 @@ static qboolean FS_ParseGameInfo( const char *gamedir, gameinfo_t *GameInfo )
 	Q_snprintf( default_gameinfo_path, sizeof( default_gameinfo_path ), "%s/gameinfo.txt", fs_basedir );
 	Q_snprintf( gameinfo_path, sizeof( gameinfo_path ), "%s/gameinfo.txt", gamedir );
 	Q_snprintf( liblist_path, sizeof( liblist_path ), "%s/liblist.gam", gamedir );
+
+#if XASH_PS2
+	/* HostFs-backed PS2 game assets are mounted read-only. Rather than
+	 * converting an original liblist.gam into an on-disk gameinfo.txt (which
+	 * needs write access), parse either format directly into the SAME
+	 * gameinfo_t used by the normal engine. This supports untouched CS 1.6
+	 * and Half-Life installations and does not fabricate a game directory. */
+	if( FS_ReadGameInfo( gameinfo_path, gamedir, GameInfo ))
+		return true;
+	if( FS_ParseLiblistGam( liblist_path, gamedir, GameInfo ))
+		return true;
+	if( FS_CheckForGameDir( gamedir ))
+	{
+		FS_InitGameInfo( GameInfo, gamedir );
+		return true;
+	}
+	return false;
+#endif
 
 	// here goes some RoDir magic...
 	if( host.rodir[0] )
@@ -2475,7 +2807,19 @@ Internal function used to determine filetime
 */
 static int FS_SysFileTime( const char *filename )
 {
-#if XASH_PSP
+#if XASH_PS2
+	char hostpath[MAX_SYSPATH];
+	int fd;
+	if( !PS2_FS_MakePath( filename, hostpath, sizeof( hostpath )))
+		return -1;
+	/* stat() through rom0:FILEIO corrupts the EE stack on a real console
+	 * (PCSX2 hides it). Report existence only; no PS2 caller needs mtime. */
+	fd = open( hostpath, O_RDONLY );
+	if( fd < 0 )
+		return -1;
+	close( fd );
+	return 0;
+#elif XASH_PSP
 	SceIoStat	buf;
 	time_t		fileTime;
 
@@ -2509,6 +2853,15 @@ static file_t *FS_SysOpen( const char *filepath, const char *mode )
 	file_t	*file;
 	int	mod, opt;
 	uint	ind;
+#if XASH_PS2
+	char hostpath[MAX_SYSPATH];
+	/* Assets use the cached installation root. Keep it read-only;
+	 * writable saves require a separate destination. */
+	if( mode[0] != 'r' || Q_strchr( mode, '+' ) ||
+		!PS2_FS_MakePath( filepath, hostpath, sizeof( hostpath )))
+		return NULL;
+	filepath = hostpath;
+#endif
 #if XASH_PSP
 #ifdef XASH_REDUCE_FD
 	qboolean backup_hold = false;
@@ -2599,7 +2952,7 @@ static file_t *FS_SysOpen( const char *filepath, const char *mode )
 #else
 	file = (file_t *)Mem_Calloc( fs_mempool, sizeof( *file ));
 #endif
-#if !XASH_PSP
+#if !XASH_PSP && !XASH_PS2 // PS2: no stat(), see FS_SysFileTime
 	file->filetime = FS_SysFileTime( filepath );
 #endif
 	file->ungetc = EOF;
@@ -2700,7 +3053,13 @@ static file_t *FS_OpenHandle( const char *syspath, int handle, fs_offset_t offse
 #ifdef HAVE_DUP
 	file->handle = dup( handle );
 #else
-	file->handle = open( syspath, O_RDONLY|O_BINARY );
+		#if XASH_PS2
+		char hostpath[MAX_SYSPATH];
+		file->handle = PS2_FS_MakePath( syspath, hostpath, sizeof( hostpath )) ?
+			open( hostpath, O_RDONLY ) : -1;
+		#else
+		file->handle = open( syspath, O_RDONLY|O_BINARY );
+		#endif
 #endif
 
 	if( lseek( file->handle, offset, SEEK_SET ) == -1 )
@@ -2739,6 +3098,20 @@ Open a packed file using its package file descriptor
 file_t *FS_OpenPackedFile( pack_t *pack, int pack_ind )
 {
 	dpackfile_t	*pfile;
+#if XASH_PS2
+	if( pack->fastpak )
+	{
+		CSFastPakFile *stream = cs_fastpak_open_at( pack->fastpak, pack_ind );
+		file_t *file;
+		if( !stream ) return NULL;
+		file = (file_t *)Mem_Calloc( fs_mempool, sizeof( *file ));
+		file->fastpak = stream;
+		file->handle = -1;
+		file->real_length = cs_fastpak_size( stream );
+		file->ungetc = EOF;
+		return file;
+	}
+#endif
 
 	pfile = &pack->files[pack_ind];
 
@@ -2775,6 +3148,24 @@ Look for a file in the filesystem only
 */
 qboolean FS_SysFileExists( const char *path, qboolean caseinsensitive )
 {
+#if XASH_PS2
+	char hostpath[MAX_SYSPATH];
+	int desc;
+	(void)caseinsensitive;
+	if( !PS2_FS_MakePath( path, hostpath, sizeof( hostpath )))
+		return false;
+	// Every loose disc file is in a dirlist.txt (PS2_ListDiscDirectory). Asking
+	// the drive instead hangs the IOP after a few thousand failed opens.
+	if( !Q_strncmp( hostpath, "cdrom", 5 ) && ( desc = PS2_DiscFileExists( hostpath )) >= 0 )
+		return desc;
+	/* PCSX2 HostFs implements open/read even when newlib stat() has no
+	 * filesystem metadata driver. Xash uses this check before opening WADs,
+	 * PAKs, fonts and menu assets; use the same read-only backend as FS_Open. */
+	desc = open( hostpath, O_RDONLY );
+	if( desc < 0 ) return false;
+	close( desc );
+	return true;
+#endif
 #if XASH_WIN32
 	int desc;
 
@@ -2831,6 +3222,18 @@ Look for a existing folder
 */
 qboolean FS_SysFolderExists( const char *path )
 {
+#if XASH_PS2
+	char hostpath[MAX_SYSPATH];
+	int known;
+	if( !PS2_FS_MakePath( path, hostpath, sizeof( hostpath )))
+		return false;
+	known = PS2_KnownType( hostpath );
+	printf( "[XASH-PS2] FS_DIR_CHECK %s known=%d\n", hostpath, known );
+	// type from the parent listing; see PS2_KnownType
+	if( known >= 0 )
+		return known;
+	path = hostpath;
+#endif
 #if XASH_WIN32
 	DWORD	dwFlags = GetFileAttributes( path );
 
@@ -2882,7 +3285,7 @@ Return the searchpath where the file was found (or NULL)
 and the file index in the package if relevant
 ====================
 */
-static searchpath_t *FS_FindFile( const char *name, int *index, qboolean gamedironly )
+static searchpath_t *FS_FindFileUncached( const char *name, int *index, qboolean gamedironly )
 {
 	searchpath_t	*search;
 	char		*pEnvPath;
@@ -2900,6 +3303,15 @@ static searchpath_t *FS_FindFile( const char *name, int *index, qboolean gamedir
 			pack_t	*pak;
 
 			pak = search->pack;
+#if XASH_PS2
+			if( pak->fastpak )
+			{
+				int found = cs_fastpak_find_index( pak->fastpak, name );
+				if( found < 0 ) continue;
+				if( index ) *index = found;
+				return search;
+			}
+#endif
 
 			// look for the file (binary search)
 			left = 0;
@@ -2952,6 +3364,12 @@ static searchpath_t *FS_FindFile( const char *name, int *index, qboolean gamedir
 			// quick reject by wadname
 			if( !anywadname && Q_stricmp( wadname, shortname ))
 				continue;
+
+#if XASH_PS2
+			// a name without a wad never opens one: every wad would open
+			if( anywadname ? !search->wad->lumps : !W_PS2Ensure( search->wad ))
+				continue;
+#endif
 
 			// NOTE: we can't using long names for wad,
 			// because we using original wad names[16];
@@ -3043,13 +3461,33 @@ static searchpath_t *FS_FindFile( const char *name, int *index, qboolean gamedir
 }
 
 
-/*
-===========
-FS_OpenReadFile
+static searchpath_t *FS_FindFile( const char *name, int *index, qboolean gamedironly )
+{
+#if XASH_PS2
+	int found;
+	searchpath_t *search;
+	/* Cache archive hits only: misses and loose files remain live. Direct
+	 * path lookups use mutable fs_directpath and must never be retained. */
+	if( !fs_ext_path )
+	{
+		search = cs_path_cache_get( &fs_archive_paths, name, gamedironly, &found );
+		if( search )
+		{
+			if( index ) *index = found;
+			return search;
+		}
+	}
+	search = FS_FindFileUncached( name, &found, gamedironly );
+	if( index ) *index = found;
+	if( !fs_ext_path && search && search->pack && search->pack->fastpak )
+		cs_path_cache_put( &fs_archive_paths, name, gamedironly, search, found );
+	return search;
+#else
+	return FS_FindFileUncached( name, index, gamedironly );
+#endif
+}
 
-Look for a file in the search paths and open it in read-only mode
-===========
-*/
+/* Open through the resolved searchpath, retaining the usual FS priority. */
 file_t *FS_OpenReadFile( const char *filename, const char *mode, qboolean gamedironly )
 {
 	searchpath_t	*search;
@@ -3111,6 +3549,7 @@ file_t *FS_Open( const char *filepath, const char *mode, qboolean gamedironly )
 	if( mode[0] == 'w' || mode[0] == 'a'|| mode[0] == 'e' || Q_strchr( mode, '+' ))
 	{
 		char	real_path[MAX_SYSPATH];
+		FS_InvalidateArchivePaths();
 
 		// open the file on disk directly
 #if XASH_PSP /* Fixed double slashes */
@@ -3136,6 +3575,14 @@ Close a file
 int FS_Close( file_t *file )
 {
 	if( !file ) return 0;
+#if XASH_PS2
+	if( file->fastpak )
+	{
+		cs_fastpak_close( file->fastpak );
+		Mem_Free( file );
+		return 0;
+	}
+#endif
 
 	FS_BackupFileName( file, NULL, 0 );
 
@@ -3163,6 +3610,9 @@ fs_offset_t FS_Write( file_t *file, const void *data, size_t datasize )
 	fs_offset_t	result;
 
 	if( !file ) return 0;
+#if XASH_PS2
+	if( file->fastpak ) return 0; // archives are read-only
+#endif
 
 	// if necessary, seek to the exact file position we're supposed to be
 	if( file->buff_ind != file->buff_len )
@@ -3218,6 +3668,16 @@ fs_offset_t FS_Read( file_t *file, void *buffer, size_t buffersize )
 		done = 1;
 	}
 	else done = 0;
+
+#if XASH_PS2
+	if( file->fastpak )
+	{
+		/* The backend supplies read-ahead; do not fill a second FS buffer. */
+		done += cs_fastpak_read( file->fastpak, (byte *)buffer + done, buffersize );
+		file->position = cs_fastpak_tell( file->fastpak );
+		return done;
+	}
+#endif
 
 	// first, we copy as many bytes as we can from "buff"
 	if( file->buff_ind < file->buff_len )
@@ -3461,6 +3921,16 @@ int FS_Seek( file_t *file, fs_offset_t offset, int whence )
 
 	if( offset < 0 || offset > file->real_length )
 		return -1;
+
+#if XASH_PS2
+	if( file->fastpak )
+	{
+		if( cs_fastpak_seek( file->fastpak, offset, SEEK_SET )) return -1;
+		FS_Purge( file );
+		file->position = offset;
+		return 0;
+	}
+#endif
 
 	// if we have the data in our read buffer, we don't need to actually seek
 	if( file->position - file->buff_len <= offset && offset <= file->position )
@@ -3940,8 +4410,12 @@ rename specified file from gamefolder
 */
 qboolean FS_Rename( const char *oldname, const char *newname )
 {
+#if XASH_PS2
+	return false;
+#endif
 	char	oldpath[MAX_SYSPATH], newpath[MAX_SYSPATH];
 	qboolean	iRet;
+	FS_InvalidateArchivePaths();
 
 	if( !oldname || !newname || !*oldname || !*newname )
 		return false;
@@ -3981,8 +4455,12 @@ delete specified file from gamefolder
 */
 qboolean GAME_EXPORT FS_Delete( const char *path )
 {
+#if XASH_PS2
+	return false;
+#endif
 	char	real_path[MAX_SYSPATH];
 	qboolean	iRet;
+	FS_InvalidateArchivePaths();
 
 	if( !path || !*path )
 		return false;
@@ -4088,7 +4566,7 @@ search_t *FS_Search( const char *pattern, int caseinsensitive, int gamedironly )
 			pak = searchpath->pack;
 			for( i = 0; i < pak->numfiles; i++ )
 			{
-				Q_strncpy( temp, pak->files[i].name, sizeof( temp ));
+				Q_strncpy( temp, FS_PackName( pak, i ), sizeof( temp ));
 				while( temp[0] )
 				{
 					if( matchpattern( temp, (char *)pattern, true ))
@@ -4147,6 +4625,11 @@ search_t *FS_Search( const char *pattern, int caseinsensitive, int gamedironly )
 			// quick reject by wadname
 			if( !anywadname && Q_stricmp( wadname, temp2 ))
 				continue;
+
+#if XASH_PS2
+			if( anywadname ? !searchpath->wad->lumps : !W_PS2Ensure( searchpath->wad ))
+				continue;
+#endif
 
 			// look through all the wad file elements
 			wad = searchpath->wad;
@@ -4258,6 +4741,7 @@ search_t *FS_Search( const char *pattern, int caseinsensitive, int gamedironly )
 
 void FS_InitMemory( void )
 {
+	FS_InvalidateArchivePaths();
 	fs_mempool = Mem_AllocPool( "FileSystem Pool" );
 	fs_searchpaths = NULL;
 }
@@ -4488,7 +4972,15 @@ wfile_t *W_Open( const char *filename, int *error )
 	if( fs_ext_path ) basename = filename;
 	else basename = COM_FileWithoutPath( filename );
 
+	#if XASH_PS2
+	/* When enumerating WADs from host:cstrike/ or host:valve/, the
+	 * discovered name already includes its game directory. Resolve it
+	 * directly instead of searching for "cstrike/foo.wad" under valve/. */
+	wad->handle = fs_ext_path ? FS_SysOpen( filename, "rb" ) :
+		FS_Open( basename, "rb", false );
+	#else
 	wad->handle = FS_Open( basename, "rb", false );
+	#endif
 
 	// HACKHACK: try to open WAD by full path for RoDir, when searchpaths are not ready
 	if( host.rodir[0] && fs_ext_path && wad->handle == NULL )
@@ -4610,6 +5102,72 @@ void W_Close( wfile_t *wad )
 		FS_Close( wad->handle );
 	Mem_Free( wad ); // free himself
 }
+
+#if XASH_PS2
+/*
+===========
+W_PS2Ensure
+
+open a wad mounted by FS_AddWad_Fullpath on its first lookup
+===========
+*/
+static qboolean W_PS2Ensure( wfile_t *wad )
+{
+	qboolean	ext_path = fs_ext_path;
+	wfile_t	*full;
+	int	error = WAD_LOAD_OK;
+
+	if( wad->lumps || wad->ps2_broken )
+		return wad->lumps != NULL;
+
+	// same lookup W_Open did at mount time: full path for folder wads, by name through the paks
+	fs_ext_path = wad->ps2_ext_path;
+	full = W_Open( wad->filename, &error );
+	fs_ext_path = ext_path;
+
+	if( !full )
+	{
+		wad->ps2_broken = true;
+		printf( "[XASH-PS2] WAD open failed %s error=%d\n", wad->filename, error );
+		return false;
+	}
+
+	full->ps2_ext_path = wad->ps2_ext_path;
+	*wad = *full;
+	Mem_Free( full );
+	printf( "[XASH-PS2] WAD open %s lumps=%d\n", wad->filename, wad->numlumps );
+	return true;
+}
+
+/*
+===========
+FS_PS2ReleaseWads
+
+after a map load its textures are uploaded: drop every lump table and file
+handle, the next lookup reopens what it needs. A wad that still has lump
+buffers out (anything besides its table) stays open.
+===========
+*/
+void FS_PS2ReleaseWads( void )
+{
+	searchpath_t	*search;
+
+	for( search = fs_searchpaths; search; search = search->next )
+	{
+		wfile_t	*wad = search->wad;
+
+		if( !wad || !wad->lumps || Mem_PS2CountAllocs( wad->mempool ) > 1 )
+			continue;
+
+		Mem_FreePool( &wad->mempool );
+		FS_Close( wad->handle );
+		wad->handle = NULL;
+		wad->lumps = NULL;
+		wad->numlumps = 0;
+		printf( "[XASH-PS2] WAD released %s\n", wad->filename );
+	}
+}
+#endif
 
 /*
 =============================================================================

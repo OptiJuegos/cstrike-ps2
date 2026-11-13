@@ -119,6 +119,22 @@ SETUP BACKENDS DEFINITIONS
 		#define XASH_REDUCE_FD
 		#define XASH_NO_TOUCH
 		#define XASH_NO_ZIP
+		#elif XASH_PS2
+			/* PS2 uses a native GS renderer and pad backend; no SDL/Wine. */
+			#ifndef XASH_VIDEO
+				#define XASH_VIDEO VIDEO_PS2
+			#endif
+			#ifndef XASH_TIMER
+				#define XASH_TIMER TIMER_PS2
+			#endif
+			#ifndef XASH_INPUT
+				#define XASH_INPUT INPUT_PS2
+			#endif
+			#ifndef XASH_SOUND
+				#define XASH_SOUND SOUND_PS2
+			#endif
+			#define XASH_NO_TOUCH
+			#define XASH_NO_ZIP
 	#endif
 
 #endif // XASH_DEDICATED
@@ -203,7 +219,7 @@ Default build-depended cvar and constant values
 	#define DEFAULT_M_IGNORE "0"
 #endif // !XASH_MOBILE_PLATFORM
 
-#if XASH_ANDROID || XASH_IOS || XASH_EMSCRIPTEN
+#if XASH_ANDROID || XASH_IOS || XASH_EMSCRIPTEN || XASH_PS2
 #define XASH_INTERNAL_GAMELIBS
 // this means that libraries are provided with engine, but not in game data
 // You need add library loading code to library.c when adding new platform
@@ -217,7 +233,7 @@ Default build-depended cvar and constant values
 // game folder used when the user does not pick one. Quake keeps "valve",
 // the Counter-Strike build ships its own game data in "cstrike".
 #ifndef DEFAULT_GAMEDIR
-	#ifdef XASH_PSP
+		#if XASH_PSP || XASH_PS2
 		#define DEFAULT_GAMEDIR "cstrike"
 	#else
 		#define DEFAULT_GAMEDIR "valve"
@@ -231,6 +247,8 @@ Default build-depended cvar and constant values
 #ifndef DEFAULT_ACCELERATED_RENDERER
 	#ifdef XASH_PSP
 			#define DEFAULT_ACCELERATED_RENDERER "gu"	
+		#elif XASH_PS2
+						#define DEFAULT_ACCELERATED_RENDERER "gs"
 	#else
 		#if XASH_MOBILE_PLATFORM
 			#define DEFAULT_ACCELERATED_RENDERER "gles1"

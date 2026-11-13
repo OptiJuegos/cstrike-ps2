@@ -1949,7 +1949,15 @@ qboolean GAME_EXPORT R_Init( void )
 	sw_reportedgeout = gEngfuncs.Cvar_Get ("sw_reportedgeout", "0", 0, "");
 	sw_reportsurfout = gEngfuncs.Cvar_Get ("sw_reportsurfout", "0", 0, "");
 	sw_stipplealpha = gEngfuncs.Cvar_Get( "sw_stipplealpha", "1", FCVAR_GLCONFIG, "nothing" );
+#if XASH_PS2
+	// 32 MiB EE RAM: prefer a 192 KiB reusable surface cache instead of
+	// the desktop default (~2.2 MiB at 480x272). Surface cache entries are
+	// evictable; this trades some redraw performance for BSP/model memory.
+	// Keep the cvar override available for performance experiments.
+	sw_surfcacheoverride = gEngfuncs.Cvar_Get ("sw_surfcacheoverride", "196608", 0, "");
+#else
 	sw_surfcacheoverride = gEngfuncs.Cvar_Get ("sw_surfcacheoverride", "0", 0, "");
+#endif
 	sw_waterwarp = gEngfuncs.Cvar_Get ("sw_waterwarp", "1", FCVAR_GLCONFIG, "nothing");
 	sw_notransbrushes = gEngfuncs.Cvar_Get( "sw_notransbrushes", "0", FCVAR_GLCONFIG, "do not apply transparency to water/glasses (faster)");
 	sw_noalphabrushes = gEngfuncs.Cvar_Get( "sw_noalphabrushes", "0", FCVAR_GLCONFIG, "do not draw brush holes (faster)");

@@ -1565,7 +1565,7 @@ static qboolean SV_RecursiveLightPoint( model_t *model, mnode_t *node, const vec
 	msurface_t	*surf;
 	mtexinfo_t	*tex;
 	mextrasurf_t	*info;
-	color24		*lm;
+	lightsample_t	*lm;
 	vec3_t		mid;
 
 	// didn't hit anything
@@ -1634,9 +1634,15 @@ static qboolean SV_RecursiveLightPoint( model_t *model, mnode_t *node, const vec
 		{
 			scale = sv.lightstyles[surf->styles[map]].value;
 
+#if XASH_PS2
+			sv_pointColor[0] += *lm * scale;
+			sv_pointColor[1] += *lm * scale;
+			sv_pointColor[2] += *lm * scale;
+#else
 			sv_pointColor[0] += lm->r * scale;
 			sv_pointColor[1] += lm->g * scale;
 			sv_pointColor[2] += lm->b * scale;
+#endif
 
 			lm += size; // skip to next lightmap
 		}

@@ -57,10 +57,10 @@ typedef struct
 
 typedef struct cl_entity_s cl_entity_t;
 
-#ifdef __PSP__
+#if defined(__PSP__) || defined(__PS2__)
 // every client entity and temp entity carries this history (28 bytes each):
-// 64 cost ~2MB in total. 16 updates are plenty on a local server.
-// MUST match cs16-client's common/cl_entity.h.
+// 64 wastes ~0.8 MB for 600 PS2 client entities. Match the original
+// client library's 16-entry console layout to preserve shared ABI.
 #define HISTORY_MAX		16		// Must be power of 2
 #else
 #define HISTORY_MAX		64		// Must be power of 2

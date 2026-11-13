@@ -14,6 +14,9 @@ GNU General Public License for more details.
 */
 
 #include "common.h"
+#if XASH_PS2
+#include "fs_paths_ps2.h"
+#endif
 #if XASH_ANDROID
 #include <android/log.h>
 #endif
@@ -137,8 +140,24 @@ void Sys_InitLog( void )
 	// create log if needed
 	if( s_ld.log_active )
 	{
+#if XASH_PS2
+		char path[MAX_SYSPATH];
+		/* Discovery is independent of the loader CWD. Explicit -log writes
+		 * a diagnostic file beside the ELF installation, not at an old CWD. */
+		if( !PS2_FS_MakePath( s_ld.log_path, path, sizeof( path )))
+		{
+			s_ld.log_active = false;
+			return;
+		}
+		Q_strncpy( s_ld.log_path, path, sizeof( s_ld.log_path ));
+#endif
 		s_ld.logfile = fopen( s_ld.log_path, mode );
-		if( !s_ld.logfile ) Con_Reportf( S_ERROR  "Sys_InitLog: can't create log file %s\n", s_ld.log_path );
+		if( !s_ld.logfile )
+		{
+			s_ld.log_active = false;
+			Con_Reportf( S_ERROR "Sys_InitLog: can't create log file %s\n", s_ld.log_path );
+			return;
+		}
 
 		fprintf( s_ld.logfile, "=================================================================================\n" );
 		fprintf( s_ld.logfile, "\t%s (build %i) started at %s\n", s_ld.title, Q_buildnum(), Q_timestamp( TIME_FULL ));

@@ -201,7 +201,16 @@ typedef struct
 
 //====================================================================
 
-#if XASH_PSP
+#if XASH_PS2 && XASH_SOUND == SOUND_NULL
+// The PS2 backend is currently silent: SNDDMA_Init fails, so every path to
+// these tables stops at dma.initialized. An SPU2 backend changes XASH_SOUND
+// and gets the regular capacity below automatically.
+#define MAX_DYNAMIC_CHANNELS	(4 + NUM_AMBIENTS)
+#define MAX_CHANNELS	(4 + MAX_DYNAMIC_CHANNELS)
+#elif XASH_PS2
+#define MAX_DYNAMIC_CHANNELS	(20 + NUM_AMBIENTS)
+#define MAX_CHANNELS	(64 + MAX_DYNAMIC_CHANNELS)	// CS maps have few ambient_generic; a full table only drops the static sound
+#elif XASH_PSP
 #define MAX_DYNAMIC_CHANNELS	(20 + NUM_AMBIENTS)
 #define MAX_CHANNELS	(128 + MAX_DYNAMIC_CHANNELS)
 #else
@@ -230,6 +239,8 @@ extern convar_t	*s_lerping;
 extern convar_t	*dsp_off;
 extern convar_t	*s_test;		// cvar to testify new effects
 extern convar_t *s_samplecount;
+extern convar_t *s_skipsounds;
+extern convar_t *s_cachekb;
 extern convar_t *snd_mute_losefocus;
 
 void S_InitScaletable( void );
@@ -282,6 +293,7 @@ rawchan_t *S_FindRawChannel( int entnum, qboolean create );
 void S_RawSamples( uint samples, uint rate, word width, word channels, const byte *data, int entnum );
 void S_StopSound( int entnum, int channel, const char *soundname );
 void S_UpdateFrame( struct ref_viewpass_s *rvp );
+void S_UpdateSplitListener( const struct ref_viewpass_s *rvp );	// splitscreen player 2, NULL for none
 uint S_GetRawSamplesLength( int entnum );
 void S_ClearRawChannel( int entnum );
 void S_StopAllSounds( qboolean ambient );

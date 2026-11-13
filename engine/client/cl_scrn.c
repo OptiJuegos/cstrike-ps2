@@ -22,6 +22,84 @@ GNU General Public License for more details.
 
 convar_t *scr_centertime;
 convar_t *scr_loading;
+#if XASH_PS2
+static qboolean	scr_loadingactive;	// between BeginLoadingPlaque and EndLoadingPlaque
+static char	scr_loadtext[40];
+static int	scr_loadcount;		// files loaded so far in this load
+static int	scr_loadtotal = 300;	// estimate: count of the previous load, updated at the end
+static double	scr_lastkeepalive;	// Sys_DoubleTime of the last nop sent while loading
+void SCR_DrawPlaque( void );
+
+static qboolean	scr_booting;		// engine start-up: bar is step/steps, not file count
+static int	scr_bootstep, scr_bootsteps;
+
+// Engine start-up draws the same plaque: init of menu, client and sound blocks
+// for several seconds before the first frame. Safe once VID_Init has returned.
+void SCR_BootStatus( const char *what, int step, int steps )
+{
+	if( Host_IsDedicated( ) || !ref.initialized )
+		return;
+
+	scr_booting = scr_loadingactive = true;
+	scr_bootstep = step;
+	scr_bootsteps = steps;
+	Q_strncpy( scr_loadtext, what, sizeof( scr_loadtext ));
+
+	if( !V_PreRender( )) return;
+	SCR_DrawPlaque();
+	V_PostRender();
+}
+
+void SCR_BootEnd( void )
+{
+	scr_booting = scr_loadingactive = false;
+	scr_loadcount = 0;
+	scr_loadtext[0] = '\0';
+}
+
+qboolean SCR_IsLoading( void )
+{
+	return scr_loadingactive;
+}
+
+// Map load blocks the main loop for tens of seconds (disc): draw the plaque
+// with the file being loaded from here, never through the console path.
+void SCR_LoadingStatus( const char *what )
+{
+	static double	last;
+	double		now;
+
+	if( !scr_loadingactive || Host_IsDedicated( ) || !what )
+		return;
+
+	scr_loadcount++;
+	Q_strncpy( scr_loadtext, what, sizeof( scr_loadtext ));
+
+	now = Sys_DoubleTime();
+
+	// The main loop is blocked, so no packet reaches the server for the whole
+	// load (a minute from USB 1.1) and it drops the client at sv_timeout.
+	// A nop every second keeps the connection; the server acks it as usual.
+	if( cls.state >= ca_connected && cls.state != ca_cinematic && !cls.demoplayback &&
+		!NET_IsLocalAddress( cls.netchan.remote_address ) && now - scr_lastkeepalive >= 1.0 )
+	{
+		sizebuf_t	buf;
+		byte		data[16];
+
+		scr_lastkeepalive = now;
+		MSG_Init( &buf, "KeepAlive", data, sizeof( data ));
+		MSG_BeginClientCmd( &buf, clc_nop );
+		Netchan_TransmitBits( &cls.netchan, MSG_GetNumBitsWritten( &buf ), MSG_GetData( &buf ));
+	}
+
+	if( now - last < 0.25 ) return; // each redraw is a GS buffer flip
+	last = now;
+
+	if( !V_PreRender( )) return;
+	SCR_DrawPlaque();
+	V_PostRender();
+}
+#endif
 convar_t *scr_download;
 convar_t *scr_viewsize;
 convar_t *cl_testlights;
@@ -333,6 +411,43 @@ void SCR_DrawPlaque( void )
 		ref.dllFuncs.R_DrawStretchPic( 0, 0, refState.width, refState.height, 0, 0, 1, 1, levelshot );
 		if( !cl.background ) CL_DrawHUD( CL_LOADING );
 	}
+#if XASH_PS2
+	else
+	{
+		// PS2: no levelshots, and CS has no gfx/lambda.lmp. Without this the
+		// last menu frame stays on screen for the whole load.
+		rgba_t	white = { 255, 255, 255, 255 };
+		int	w, h;
+
+		ref.dllFuncs.FillRGBABlend( 0, 0, refState.width, refState.height, 0, 0, 0, 255 );
+		if( scr_loadingactive )
+		{
+			int	bw = refState.width * 6 / 10;
+			int	bx = ( refState.width - bw ) / 2;
+			int	by = refState.height * 7 / 8;
+			int	fill = scr_booting ? bw * scr_bootstep / Q_max( scr_bootsteps, 1 ) :
+				bw * Q_min( scr_loadcount, scr_loadtotal - 1 ) / Q_max( scr_loadtotal, 1 );
+
+			ref.dllFuncs.FillRGBABlend( bx - 2, by - 2, bw + 4, 10, 90, 90, 90, 255 );
+			ref.dllFuncs.FillRGBABlend( bx, by, bw, 6, 0, 0, 0, 255 );
+			ref.dllFuncs.FillRGBABlend( bx, by, fill, 6, 255, 255, 255, 255 );
+		}
+		if( scr_loadtext[0] )
+		{
+			rgba_t	grey = { 160, 160, 160, 255 };
+
+			Con_DrawStringLen( scr_loadtext, &w, &h );
+			Con_DrawString(( refState.width - w ) / 2, refState.height * 3 / 4, scr_loadtext, grey );
+		}
+		if( cls.loadingBar )
+			CL_DrawHUD( CL_LOADING );
+		else
+		{
+			Con_DrawStringLen( "Loading...", &w, &h );
+			Con_DrawString(( refState.width - w ) / 2, ( refState.height - h ) / 2, "Loading...", white );
+		}
+	}
+#endif
 }
 
 /*
@@ -356,6 +471,24 @@ void SCR_BeginLoadingPlaque( qboolean is_background )
 		if( cls.state == ca_disconnected && !(GameState->curstate == STATE_RUNFRAME && GameState->nextstate != STATE_RUNFRAME) )
 			SCR_UpdateScreen();
 	}
+
+#if XASH_PS2
+	if( !is_background && !scr_loadingactive )
+	{
+		scr_loadingactive = true;
+		// "map" typed in the console leaves key_dest console and the OSK open
+		if( cls.key_dest == key_console )
+			Key_SetKeyDest( key_game );
+		scr_loadcount = 0;
+	}
+	// Starting a map from the menu: the server loads before the client
+	// connects, with no frame drawn. Show the plaque now, once.
+	if( cls.state == ca_disconnected && !is_background && !cls.disable_screen && V_PreRender( ))
+	{
+		SCR_DrawPlaque();
+		V_PostRender();
+	}
+#endif
 
 	if( cls.state == ca_disconnected || cls.disable_screen )
 		return; // already set
@@ -387,6 +520,12 @@ SCR_EndLoadingPlaque
 void SCR_EndLoadingPlaque( void )
 {
 	cls.disable_screen = 0.0f;
+#if XASH_PS2
+	if( scr_loadcount > 20 ) scr_loadtotal = scr_loadcount;
+	scr_loadcount = 0;
+	scr_loadingactive = false;
+	scr_loadtext[0] = '\0';
+#endif
 	Con_ClearNotify();
 //	SNDDMA_UnlockSound();
 }
@@ -508,6 +647,13 @@ void SCR_UpdateScreen( void )
 	switch( cls.state )
 	{
 	case ca_disconnected:
+#if XASH_PS2
+		if(( SV_Active( ) || ( scr_loadingactive && cls.key_dest != key_console )) && cls.key_dest != key_menu )
+		{
+			SCR_DrawPlaque(); // local map loading, see Con_DrawConsole
+			break;
+		}
+#endif
 		Con_RunConsole ();
 		break;
 	case ca_connecting:

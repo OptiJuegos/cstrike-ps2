@@ -33,6 +33,101 @@ convar_t		*r_wadtextures;
 convar_t		*r_showhull;
 model_t		*loadmodel;
 
+#if XASH_PS2
+/* A byte-identical copy of gign.mdl is shipped as models/player.mdl in CS.
+ * Keep a separate model identity but borrow its immutable Studio payload;
+ * the source must outlive the borrowing model. */
+static model_t *ps2_player_alias;
+static model_t *ps2_player_source;
+
+static qboolean Mod_PS2FilesIdentical( const char *first, const char *second, CRC32_t *crcResult )
+{
+	file_t *a = FS_Open( first, "rb", false );
+	file_t *b = FS_Open( second, "rb", false );
+	fs_offset_t left;
+	byte x[4096], y[4096];
+	CRC32_t crc;
+	qboolean same = true;
+
+	if( !a || !b )
+	{
+		if( a ) FS_Close( a );
+		if( b ) FS_Close( b );
+		return false;
+	}
+
+	left = FS_FileLength( a );
+	if( left <= 0 || left != FS_FileLength( b )) same = false;
+	CRC32_Init( &crc );
+	while( same && left > 0 )
+	{
+		size_t count = (size_t)Q_min( left, (fs_offset_t)sizeof( x ) );
+		if( FS_Read( a, x, count ) != count || FS_Read( b, y, count ) != count ||
+			memcmp( x, y, count ))
+		{
+			same = false;
+			break;
+		}
+		CRC32_ProcessBuffer( &crc, x, count );
+		left -= count;
+	}
+	FS_Close( a );
+	FS_Close( b );
+	if( same && crcResult ) *crcResult = CRC32_Final( crc );
+	return same;
+}
+
+static qboolean Mod_PS2ReuseIdenticalPlayer( model_t *mod, const char *name )
+{
+	model_t *source = NULL;
+	model_info_t *info;
+	CRC32_t crc;
+	int i;
+
+	if( Q_stricmp( name, "models/player.mdl" ) || ps2_player_alias ) return false;
+	for( i = 0; i < mod_numknown; i++ )
+	{
+		model_t *candidate = &mod_known[i];
+		if( !Q_stricmp( candidate->name, "models/player/gign/gign.mdl" ) &&
+			candidate->type == mod_studio && candidate->mempool && candidate->cache.data )
+		{
+			source = candidate;
+			break;
+		}
+	}
+	if( !source || !Mod_PS2FilesIdentical( name, source->name, &crc )) return false;
+
+	info = &mod_crcinfo[mod - mod_known];
+	if( FBitSet( info->flags, FCRC_SHOULD_CHECKSUM ))
+	{
+		if( FBitSet( info->flags, FCRC_CHECKSUM_DONE ) && info->initialCRC != crc )
+			Host_Error( "%s has a bad checksum\n", name );
+		SetBits( info->flags, FCRC_CHECKSUM_DONE );
+		info->initialCRC = crc;
+	}
+
+	/* Own the lightweight wrapper, never the source's Studio payload. */
+	*mod = *source;
+	Q_strncpy( mod->name, name, sizeof( mod->name ));
+	mod->mempool = Mem_AllocPool( va( "^2%s^7 (shared Studio)", name ));
+	mod->needload = NL_PRESENT;
+	ps2_player_alias = mod;
+	ps2_player_source = source;
+	loadmodel = mod;
+	if( Host_IsDedicated() )
+	{
+		if( svgame.physFuncs.Mod_ProcessUserData )
+			svgame.physFuncs.Mod_ProcessUserData( mod, true, (byte *)mod->cache.data );
+	}
+#if !XASH_DEDICATED
+	else ref.dllFuncs.Mod_ProcessRenderData( mod, true, (byte *)mod->cache.data );
+#endif
+	printf( "[XASH-PS2] STAGE=STUDIO_IDENTICAL_REUSED alias=%s source=%s bytes=%u\n",
+		name, source->name, (unsigned)((studiohdr_t *)mod->cache.data)->length );
+	return true;
+}
+#endif
+
 /*
 ===============================================================================
 
@@ -93,7 +188,7 @@ static void Mod_FreeUserData( model_t *mod )
 #endif
 }
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 // the loaded models list for mod_studio.c (shared player animations),
 // NULL past the end
 model_t *Mod_PSPKnownModel( int i )
@@ -113,7 +208,14 @@ void Mod_FreeModel( model_t *mod )
 	if( !mod || !mod->name[0] )
 		return;
 
-#if XASH_PSP
+#if XASH_PS2
+	if( mod == ps2_player_source && ps2_player_alias )
+		Mod_FreeModel( ps2_player_alias );
+	if( mod == ps2_player_alias )
+		ps2_player_alias = ps2_player_source = NULL;
+#endif
+
+#if XASH_PSP || XASH_PS2
 	if( mod->type == mod_studio )
 	{
 		void Mod_StudioUnshare( model_t *mod );
@@ -407,8 +509,13 @@ model_t *Mod_LoadModel( model_t *mod, qboolean crash )
 	char		tempname[MAX_QPATH];
 	fs_offset_t		length = 0;
 	qboolean		loaded;
+	qboolean		fileAdopted = false;
+	CRC32_t			precomputedStudioCRC = 0;
 	byte		*buf;
 	model_info_t	*p;
+#if XASH_PS2
+	qboolean ps2TraceGibs;
+#endif
 #if XASH_PSP
 	qboolean		isvolatile;
 #define Mod_FreeFile( b )	Mod_PSPFreeFile( b, isvolatile )
@@ -430,6 +537,13 @@ model_t *Mod_LoadModel( model_t *mod, qboolean crash )
 	// store modelname to show error
 	Q_strncpy( tempname, mod->name, sizeof( tempname ));
 	COM_FixSlashes( tempname );
+#if XASH_PS2
+	SCR_LoadingStatus( tempname );
+#endif
+#if XASH_PS2
+	ps2TraceGibs = !Q_stricmp( tempname, "models/mil_crategibs.mdl" );
+	if( Mod_PS2ReuseIdenticalPlayer( mod, tempname )) return mod;
+#endif
 
 #if XASH_PSP
 	buf = Mod_PSPLoadFile( tempname, &length, &isvolatile );
@@ -452,14 +566,37 @@ model_t *Mod_LoadModel( model_t *mod, qboolean crash )
 	mod->type = mod_bad;
 	loadmodel = mod;
 
+	// PS2 can keep the original Studio allocation as model-owned data.
+	// Studio texture upload rewrites header indices, so compute the CRC
+	// over the untouched complete file before the loader can modify it.
+#if XASH_PS2
+	if( *(uint *)buf == IDSTUDIOHEADER )
+	{
+		CRC32_Init( &precomputedStudioCRC );
+		CRC32_ProcessBuffer( &precomputedStudioCRC, buf, length );
+		precomputedStudioCRC = CRC32_Final( precomputedStudioCRC );
+	}
+#endif
+
 	// call the apropriate loader
 	switch( *(uint *)buf )
 	{
 	case IDSTUDIOHEADER:
-		Mod_LoadStudioModel( mod, buf, &loaded );
+		Mod_LoadStudioModel( mod, buf, &loaded, &fileAdopted );
+#if XASH_PS2
+			if( ps2TraceGibs ) printf( "[XASH-PS2] STAGE=GIBS_STUDIO_LOADER_DONE loaded=%d adopted=%d\n", loaded, fileAdopted );
+#endif
 		break;
 	case IDSPRITEHEADER:
+			#if XASH_PS2
+			if( !Q_strnicmp( tempname, "sprites/640hud", 14 ))
+				printf( "[XASH-PS2] STAGE=HUD_MODEL_ENGINE_BEGIN name=%s\n", tempname );
+			#endif
 		Mod_LoadSpriteModel( mod, buf, &loaded, 0 );
+			#if XASH_PS2
+			if( !Q_strnicmp( tempname, "sprites/640hud", 14 ))
+				printf( "[XASH-PS2] STAGE=HUD_MODEL_ENGINE_DONE name=%s loaded=%d\n", tempname, loaded );
+			#endif
 		break;
 	case IDALIASHEADER:
 		// REFTODO: move server-related code here
@@ -479,6 +616,9 @@ model_t *Mod_LoadModel( model_t *mod, qboolean crash )
 	}
 	if( loaded )
 	{
+		// An adopted Studio file may have moved during a shrink or animation
+		// deduplication. The renderer callback must use the live model data.
+		const byte *renderBuffer = fileAdopted ? (const byte *)mod->cache.data : buf;
 		if( world.loading )
 			SetBits( mod->flags, MODEL_WORLD ); // mark worldmodel
 
@@ -487,21 +627,32 @@ model_t *Mod_LoadModel( model_t *mod, qboolean crash )
 			if( svgame.physFuncs.Mod_ProcessUserData != NULL )
 			{
 				// let the server.dll load custom data
-				svgame.physFuncs.Mod_ProcessUserData( mod, true, buf );
+				svgame.physFuncs.Mod_ProcessUserData( mod, true, renderBuffer );
 			}
 		}
 #if !XASH_DEDICATED
 		else
 		{
-			loaded = ref.dllFuncs.Mod_ProcessRenderData( mod, true, buf );
+				#if XASH_PS2
+				if( !Q_strnicmp( tempname, "sprites/640hud", 14 ))
+					printf( "[XASH-PS2] STAGE=HUD_MODEL_RENDER_BEGIN name=%s\n", tempname );
+				#endif
+			loaded = ref.dllFuncs.Mod_ProcessRenderData( mod, true, renderBuffer );
+				#if XASH_PS2
+				if( !Q_strnicmp( tempname, "sprites/640hud", 14 ))
+					printf( "[XASH-PS2] STAGE=HUD_MODEL_RENDER_DONE name=%s loaded=%d\n", tempname, loaded );
+				#endif
 		}
 #endif
 	}
 
+#if XASH_PS2
+	if( ps2TraceGibs ) printf( "[XASH-PS2] STAGE=GIBS_RENDER_DONE loaded=%d\n", loaded );
+#endif
 	if( !loaded )
 	{
 		Mod_FreeModel( mod );
-		Mod_FreeFile( buf );
+		if( !fileAdopted ) Mod_FreeFile( buf );
 
 		if( crash ) Host_Error( "Could not load model %s\n", tempname );
 		else Con_Printf( S_ERROR "Could not load model %s\n", tempname );
@@ -516,9 +667,15 @@ model_t *Mod_LoadModel( model_t *mod, qboolean crash )
 	{
 		CRC32_t	currentCRC;
 
+#if XASH_PS2
+		if( fileAdopted ) currentCRC = precomputedStudioCRC;
+		else
+#endif
+		{
 		CRC32_Init( &currentCRC );
 		CRC32_ProcessBuffer( &currentCRC, buf, length );
 		currentCRC = CRC32_Final( currentCRC );
+		}
 
 		if( FBitSet( p->flags, FCRC_CHECKSUM_DONE ))
 		{
@@ -531,7 +688,10 @@ model_t *Mod_LoadModel( model_t *mod, qboolean crash )
 			p->initialCRC = currentCRC;
 		}
 	}
-	Mod_FreeFile( buf );
+	if( !fileAdopted ) Mod_FreeFile( buf );
+#if XASH_PS2
+	if( ps2TraceGibs ) printf( "[XASH-PS2] STAGE=GIBS_MODEL_COMPLETE\n" );
+#endif
 #undef Mod_FreeFile
 
 	return mod;

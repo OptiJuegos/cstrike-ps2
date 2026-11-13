@@ -15,6 +15,7 @@ GNU General Public License for more details.
 */
 
 #include "gu_local.h"
+#include "ps2_perf.h"
 #include "xash3d_mathlib.h"
 #include "library.h"
 #include "beamdef.h"
@@ -429,8 +430,15 @@ void R_LoadViewModelProjection( qboolean viewmodel )
 		Matrix4x4_CreateProjection( m, xMax, -xMax, yMax, -yMax, zNear, zFar );
 		GL_LoadMatrix( m );
 
+#if XASH_PS2
+		// VU1 clips against the near plane and the guard band, so the weapon takes
+		// the same direct path as other models instead of clipping on the EE
+		(void)mvp;
+		R_StudioSetViewModelClip( NULL, 0.0f );
+#else
 		Matrix4x4_Concat( mvp, m, RI.worldviewMatrix );
 		R_StudioSetViewModelClip( mvp, zNear );
+#endif
 	}
 	else
 	{
@@ -1069,12 +1077,20 @@ void R_RenderScene( void )
 	R_DrawFog ();
 
 	R_CheckGLFog();
-	R_DrawWorld();
+	{
+		PS2_PERF_BEGIN( WORLD );
+		R_DrawWorld();
+		PS2_PERF_END( WORLD );
+	}
 	R_CheckFog();
 
 	gEngfuncs.CL_ExtraUpdate ();	// don't let sound get messed up if going slow
 
-	R_DrawEntitiesOnList();
+	{
+		PS2_PERF_BEGIN( ENTS );
+		R_DrawEntitiesOnList();
+		PS2_PERF_END( ENTS );
+	}
 
 	R_DrawWaterSurfaces();
 
@@ -1150,6 +1166,9 @@ void R_SetupRefParams( const ref_viewpass_t *rvp )
 	RI.params = RP_NONE;
 	RI.drawWorld = FBitSet( rvp->flags, RF_DRAW_WORLD );
 	RI.onlyClientDraw = FBitSet( rvp->flags, RF_ONLY_CLIENTDRAW );
+#if XASH_PS2
+	RI.drawCubemap = FBitSet( rvp->flags, RF_DRAW_CUBEMAP );
+#endif
 	RI.farClip = 0;
 
 	if( !FBitSet( rvp->flags, RF_DRAW_CUBEMAP ))

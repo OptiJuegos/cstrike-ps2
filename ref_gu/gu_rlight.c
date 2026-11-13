@@ -229,7 +229,8 @@ static qboolean R_RecursiveLightPoint( model_t *model, mnode_t *node, float p1f,
 	int		i, map, side, size;
 	float		ds, dt, s, t;
 	int		sample_size;
-	color24		*lm, *dm;
+	lightsample_t	*lm;
+	color24		*dm;
 	mextrasurf_t	*info;
 	msurface_t	*surf;
 	mtexinfo_t	*tex;
@@ -338,15 +339,27 @@ static qboolean R_RecursiveLightPoint( model_t *model, mnode_t *node, float p1f,
 
 			if( tr.ignore_lightgamma )
 			{
+#if XASH_PS2
+				cv->r += *lm * scale;
+				cv->g += *lm * scale;
+				cv->b += *lm * scale;
+#else
 				cv->r += lm->r * scale;
 				cv->g += lm->g * scale;
 				cv->b += lm->b * scale;
+#endif
 			}
 			else
 			{
+#if XASH_PS2
+				cv->r += gEngfuncs.LightToTexGamma( *lm ) * scale;
+				cv->g += gEngfuncs.LightToTexGamma( *lm ) * scale;
+				cv->b += gEngfuncs.LightToTexGamma( *lm ) * scale;
+#else
 				cv->r += gEngfuncs.LightToTexGamma( lm->r ) * scale;
 				cv->g += gEngfuncs.LightToTexGamma( lm->g ) * scale;
 				cv->b += gEngfuncs.LightToTexGamma( lm->b ) * scale;
+#endif
 			}
 			lm += size; // skip to next lightmap
 

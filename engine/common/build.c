@@ -95,6 +95,8 @@ const char *Q_buildos( void )
 	osname = "DOS4GW";
 #elif XASH_PSP
 	osname = "psp";
+#elif XASH_PS2
+		osname = "ps2";
 #else
 #error "Place your operating system name here! If this is a mistake, try to fix conditions above and report a bug"
 #endif

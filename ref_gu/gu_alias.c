@@ -22,6 +22,14 @@ GNU General Public License for more details.
 #include "pm_local.h"
 #include "pmtrace.h"
 
+#if XASH_PS2
+// CS ships no Quake alias models: the loader and renderer cost about 130 KB of RAM
+void R_AliasInit( void ) { }
+void Mod_LoadAliasModel( model_t *mod, const void *buffer, qboolean *loaded ) { if( loaded ) *loaded = false; }
+void Mod_AliasUnloadTextures( void *data ) { }
+void R_DrawAliasModel( cl_entity_t *e ) { }
+#else
+
 // Quake 1
 #undef MAXALIASVERTS
 #undef MAXALIASFRAMES
@@ -1549,3 +1557,5 @@ void R_DrawAliasModel( cl_entity_t *e )
 }
 
 //==================================================================================
+
+#endif // XASH_PS2

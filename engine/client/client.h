@@ -95,11 +95,8 @@ typedef struct
 #define ANGLE_MASK		(ANGLE_BACKUP - 1)
 
 #define CL_UPDATE_MASK	(CL_UPDATE_BACKUP - 1)
-#if XASH_LOW_MEMORY == 2
-#define CL_UPDATE_BACKUP SINGLEPLAYER_BACKUP
-#else
+// picked per game (cl_game.c): local games keep the small history
 extern int CL_UPDATE_BACKUP;
-#endif
 
 #define SIGNONS		2		// signon messages to receive before connected
 #define INVALID_HANDLE	0xFFFF		// for XashXT cache system
@@ -201,9 +198,9 @@ typedef struct
 
 	uint		checksum;			// for catching cheater maps
 
-	frame_t		frames[MULTIPLAYER_BACKUP];		// alloced on svc_serverdata
+	frame_t		*frames;			// CL_UPDATE_BACKUP slots, see CL_SetUpdateBackup
 	runcmd_t		commands[MULTIPLAYER_BACKUP];		// each mesage will send several old cmds
-	local_state_t	predicted_frames[MULTIPLAYER_BACKUP];	// local client state
+	local_state_t	*predicted_frames;		// local client state, CL_UPDATE_BACKUP slots
 
 	double		time;			// this is the time value that the client
 						// is rendering at.  always <= cls.realtime
@@ -261,7 +258,7 @@ typedef struct
 	qboolean		need_force_consistency_response;
 	resource_t	resourcesonhand;
 	resource_t	resourcesneeded;
-	resource_t	resourcelist[MAX_RESOURCES];
+	resource_t	resourcelist[4];		// only CL_CreateResourceList fills it (the custom logo)
 	int		num_resources;
 
 	short		sound_index[MAX_SOUNDS];
@@ -808,6 +805,8 @@ void CL_ParseTextMessage( sizebuf_t *msg );
 void CL_DrawHUD( int state );
 void CL_InitEdicts( void );
 void CL_FreeEdicts( void );
+void CL_SetUpdateBackup( int backup );
+void CL_FreeUpdateFrames( void );
 void CL_ClearWorld( void );
 void CL_DrawCenterPrint( void );
 void CL_ClearSpriteTextures( void );
@@ -876,6 +875,9 @@ void SCR_DirtyScreen( void );
 void SCR_AddDirtyPoint( int x, int y );
 void SCR_InstallParticlePalette( void );
 void SCR_EndLoadingPlaque( void );
+#if XASH_PS2
+qboolean SCR_IsLoading( void ); // map load plaque active
+#endif
 void SCR_RegisterTextures( void );
 void SCR_LoadCreditsFont( void );
 void SCR_MakeScreenShot( void );
@@ -899,6 +901,9 @@ void V_Shutdown( void );
 qboolean V_PreRender( void );
 void V_PostRender( void );
 void V_RenderView( void );
+qboolean V_SplitActive( void );
+// height of the client library's HUD area: player 1's half in splitscreen
+#define CL_HUD_HEIGHT	( V_SplitActive() ? refState.height / 2 : refState.height )
 
 //
 // cl_pmove.c

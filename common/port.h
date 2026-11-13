@@ -93,6 +93,20 @@ GNU General Public License for more details.
 	#define FreeLibrary( x )		( 0 )
 #endif
 
+#if XASH_PS2
+		#include <unistd.h>
+		#include <sys/stat.h>
+		#define PATH_SPLITTER "/"
+		#define O_BINARY 0
+		#define O_TEXT 0
+		#define _mkdir( x ) mkdir( x, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH )
+		#define SetCurrentDirectory( x ) ( !chdir( x ) )
+		/* The EE target uses one statically linked game executable. */
+		#define LoadLibrary( x ) ( 0 )
+		#define GetProcAddress( x, y ) ( 0 )
+		#define FreeLibrary( x ) ( 0 )
+#endif
+
 	//#define MAKEWORD( a, b )			((short int)(((unsigned char)(a))|(((short int)((unsigned char)(b)))<<8)))
 	#define max( a, b )                 (((a) > (b)) ? (a) : (b))
 	#define min( a, b )                 (((a) < (b)) ? (a) : (b))
@@ -120,7 +134,8 @@ GNU General Public License for more details.
 	#define PATH_SPLITTER "\\"
 	#ifdef __MINGW32__
 		#define _inline static inline
-		#define FORCEINLINE inline __attribute__((always_inline))
+		// FORCEINLINE comes from winnt.h: redefining it drops __gnu_inline__
+		// and every object then defines NtCurrentTeb and friends
 	#else
 		#define FORCEINLINE __forceinline
 	#endif

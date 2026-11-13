@@ -22,6 +22,7 @@ GNU General Public License for more details.
 #include "vgui_draw.h"
 #include "library.h"
 #include "vid_common.h"
+#include "ps2_perf.h"
 #if XASH_PSP
 #include "platform/psp/psp_perf.h"
 #endif
@@ -1336,7 +1337,7 @@ resource_t *CL_AddResource( resourcetype_t type, const char *name, int size, qbo
 {
 	resource_t	*r = &cl.resourcelist[cl.num_resources];
 
-	if( cl.num_resources >= MAX_RESOURCES )
+	if( cl.num_resources >= ARRAYSIZE( cl.resourcelist ))
 		Host_Error( "Too many resources on client\n" );
 	cl.num_resources++;
 
@@ -1418,7 +1419,11 @@ void CL_Connect_f( void )
 
 	// TESTTEST: a see console during connection
 	UI_SetActiveMenu( false );
+#if XASH_PS2
+	Key_SetKeyDest( key_game ); // the console opens the OSK; SCR_DrawPlaque shows the loading screen
+#else
 	Key_SetKeyDest( key_console );
+#endif
 
 	cls.state = ca_connecting;
 	cls.legacymode = legacyconnect;
@@ -1506,12 +1511,14 @@ void CL_ClearState( void )
 	S_StopAllSounds ( true );
 	CL_ClearEffects ();
 	CL_FreeEdicts ();
+	CL_FreeUpdateFrames ();
 
 	CL_ClearPhysEnts ();
 	NetAPI_CancelAllRequests();
 
 	// wipe the entire cl structure
 	memset( &cl, 0, sizeof( cl ));
+	CL_SetUpdateBackup( SINGLEPLAYER_BACKUP );
 	MSG_Clear( &cls.netchan.message );
 	memset( &clgame.fade, 0, sizeof( clgame.fade ));
 	memset( &clgame.shake, 0, sizeof( clgame.shake ));
@@ -1653,6 +1660,15 @@ void CL_Disconnect( void )
 	if( cls.state == ca_disconnected )
 		return;
 
+#if XASH_PS2
+	{
+		void UI_PS2RestoreBackground( void ) __attribute__(( weak )); // absent without MainUI
+
+		if( UI_PS2RestoreBackground )
+			UI_PS2RestoreBackground();
+	}
+#endif
+
 	cls.connect_time = 0;
 	cls.changedemo = false;
 	cls.max_fragment_size = FRAGMENT_MAX_SIZE; // reset fragment size
@@ -1680,6 +1696,12 @@ void CL_Disconnect( void )
 			Mod_FreeAll();
 			PSP_LogHeapUsage( "after disconnect" );
 		}
+	}
+#elif XASH_PS2
+	{
+		// sounds load on first play and scatter over the heap; free them before the next map
+		void S_PurgeSoundData( void );
+		S_PurgeSoundData();
 	}
 #endif
 
@@ -2496,7 +2518,15 @@ void CL_ReadPackets( void )
 	if( cls.demorecording && !cls.demowaiting )
 		cls.demotime += host.frametime;
 
+	#if XASH_PS2
+	if( cls.signon >= SIGNONS - 1 && cls.state != ca_active )
+		printf( "[XASH-PS2] STAGE=CL_READNET_BEGIN state=%d signon=%d\n", cls.state, cls.signon );
+	#endif
 	CL_ReadNetMessage();
+	#if XASH_PS2
+	if( cls.signon >= SIGNONS - 1 && cls.state != ca_active )
+		printf( "[XASH-PS2] STAGE=CL_READNET_DONE state=%d signon=%d\n", cls.state, cls.signon );
+	#endif
 
 	CL_ApplyAddAngle();
 #if 0
@@ -3197,6 +3227,12 @@ Host_ClientFrame
 */
 void Host_ClientFrame( void )
 {
+	#if XASH_PS2
+	static int ps2_client_spawn_frames = 0;
+	qboolean ps2_trace = SV_Active() && cls.signon >= SIGNONS - 1 &&
+		ps2_client_spawn_frames++ < 6;
+	if( ps2_trace ) printf( "[XASH-PS2] STAGE=CL_SPAWNED_FRAME_ENTER cls=%d signon=%d\n", cls.state, cls.signon );
+	#endif
 #if XASH_PSP
 	double	perf_start, perf_part, perf_render, perf_sound;
 #endif
@@ -3212,13 +3248,30 @@ void Host_ClientFrame( void )
 	// the incoming messages have been read
 	if( !SV_Active( )) CL_SendCommand ();
 
-	clgame.dllFuncs.pfnFrame( host.frametime );
+	{
+		PS2_PERF_BEGIN( CLDLL );
+		clgame.dllFuncs.pfnFrame( host.frametime );
+		PS2_PERF_END( CLDLL );
+	}
+	#if XASH_PS2
+	if( ps2_trace ) printf( "[XASH-PS2] STAGE=CL_SPAWNED_FRAME_CALLBACK_DONE\n" );
+	#endif
 
 	// remember last received framenum
 	CL_SetLastUpdate ();
+	#if XASH_PS2
+	if( ps2_trace ) printf( "[XASH-PS2] STAGE=CL_SPAWNED_LASTUPDATE_DONE\n" );
+	#endif
 
 	// read updates from server
-	CL_ReadPackets ();
+	{
+		PS2_PERF_BEGIN( CLPKT );
+		CL_ReadPackets ();
+		PS2_PERF_END( CLPKT );
+	}
+	#if XASH_PS2
+	if( ps2_trace ) printf( "[XASH-PS2] STAGE=CL_SPAWNED_PACKETS_DONE cls=%d signon=%d\n", cls.state, cls.signon );
+	#endif
 
 	// do prediction again in case we got
 	// a new portion updates from server
@@ -3228,7 +3281,14 @@ void Host_ClientFrame( void )
 //	Voice_Idle( host.frametime );
 
 	// emit visible entities
-	CL_EmitEntities ();
+	{
+		PS2_PERF_BEGIN( CLEMIT );
+		CL_EmitEntities ();
+		PS2_PERF_END( CLEMIT );
+	}
+	#if XASH_PS2
+	if( ps2_trace ) printf( "[XASH-PS2] STAGE=CL_SPAWNED_ENTITIES_DONE\n" );
+	#endif
 
 	// in case we lost connection
 	CL_CheckForResend ();
@@ -3265,10 +3325,18 @@ void Host_ClientFrame( void )
 	psp_perf.client += Sys_DoubleTime() - perf_start - perf_render - perf_sound;
 #else
 	// update the screen
-	SCR_UpdateScreen ();
+	{
+		PS2_PERF_BEGIN( SCR );
+		SCR_UpdateScreen ();
+		PS2_PERF_END( SCR );
+	}
 
 	// update audio
-	SND_UpdateSound ();
+	{
+		PS2_PERF_BEGIN( SND );
+		SND_UpdateSound ();
+		PS2_PERF_END( SND );
+	}
 
 	// play avi-files
 	SCR_RunCinematic ();
@@ -3289,13 +3357,23 @@ void CL_Init( void )
 {
 	string libpath;
 
+	CL_SetUpdateBackup( SINGLEPLAYER_BACKUP ); // cl.frames is a pointer now, never leave it NULL
+
 	if( host.type == HOST_DEDICATED )
 		return; // nothing running on the client
 
 	CL_InitLocal();
+	CL_SplitInit();
+	CL_IntroInit();
 
 	VID_Init();	// init video
+#if XASH_PS2
+	SCR_BootStatus( "Starting sound", 1, 5 );
+#endif
 	S_Init();	// init sound
+#if XASH_PS2
+	SCR_BootStatus( "Loading client", 2, 5 );
+#endif
 
 	// unreliable buffer. unsed for unreliable commands and voice stream
 	MSG_Init( &cls.datagram, "cls.datagram", cls.datagram_buf, sizeof( cls.datagram_buf ));
@@ -3308,6 +3386,9 @@ void CL_Init( void )
 	if( !CL_LoadProgs( libpath ) )
 		Host_Error( "can't initialize %s: %s\n", libpath, COM_GetLibraryError() );
 
+#if XASH_PS2
+	SCR_BootStatus( "Loading config", 3, 5 );
+#endif
 	cls.initialized = true;
 	cl.maxclients = 1; // allow to drawing player in menu
 	cls.olddemonum = -1;

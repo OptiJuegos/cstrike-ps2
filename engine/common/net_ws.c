@@ -85,6 +85,10 @@ static int ioctl_stub( int d, unsigned long r, ... )
 	return 0;
 }
 #define ioctlsocket ioctl_stub
+#elif XASH_PS2
+// libcglue routes _ioctl to lwIP for sockets but has no public ioctl
+int _ioctl( int fd, int request, void *arg );
+#define ioctlsocket _ioctl
 #else // XASH_EMSCRIPTEN
 #define ioctlsocket ioctl
 #endif // XASH_EMSCRIPTEN
@@ -112,7 +116,7 @@ typedef int WSAsize_t;
 #define SPLITPACKET_MAX_SIZE			64000
 #define NET_MAX_FRAGMENTS		( NET_MAX_FRAGMENT / (SPLITPACKET_MIN_SIZE - sizeof( SPLITPACKET )) )
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 // the listen server talks to its own client through these: NET_MAX_MESSAGE
 // each made 256 KB, but in game the packets are a few KB. A buffer grows to
 // the message it carries, and one over NET_LOOPBACK_KEEP (connection setup)
@@ -360,7 +364,7 @@ int NET_GetHostByName( const char *hostname )
 #endif
 }
 
-#if !defined XASH_NO_ASYNC_NS_RESOLVE && ( XASH_WIN32 || !(XASH_EMSCRIPTEN || XASH_DOS4GW || XASH_PSP) )
+#if !defined XASH_NO_ASYNC_NS_RESOLVE && ( XASH_WIN32 || !(XASH_EMSCRIPTEN || XASH_DOS4GW || XASH_PSP || XASH_PS2) )
 #define CAN_ASYNC_NS_RESOLVE
 #endif
 
@@ -385,7 +389,7 @@ void *NET_ThreadStart( void *unused )
 #define mutex_lock EnterCriticalSection
 #define mutex_unlock LeaveCriticalSection
 #define detach_thread( x ) CloseHandle(x)
-#define create_thread( pfn ) nsthread.thread = CreateThread( NULL, 0, pfn, NULL, 0, NULL )
+#define create_thread( pfn ) ( nsthread.thread = CreateThread( NULL, 0, pfn, NULL, 0, NULL ))
 #define mutex_t  CRITICAL_SECTION
 #define thread_t HANDLE
 DWORD WINAPI NET_ThreadStart( LPVOID unused )
@@ -420,8 +424,8 @@ static struct nsthread_s
 static void NET_InitializeCriticalSections( void )
 {
 	net.threads_initialized = true;
-	pInitializeCriticalSection( &nsthread.mutexns );
-	pInitializeCriticalSection( &nsthread.mutexres );
+	InitializeCriticalSection( &nsthread.mutexns );
+	InitializeCriticalSection( &nsthread.mutexres );
 }
 #endif
 
@@ -771,7 +775,7 @@ static qboolean NET_GetLoopPacket( netsrc_t sock, netadr_t *from, byte *data, si
 	memcpy( data, loop->msgs[i].data, loop->msgs[i].datalen );
 	*length = loop->msgs[i].datalen;
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	if( loop->msgs[i].size > NET_LOOPBACK_KEEP )
 	{
 		free( loop->msgs[i].data );
@@ -800,7 +804,7 @@ static void NET_SendLoopPacket( netsrc_t sock, size_t length, const void *data, 
 
 	i = loop->send & MASK_LOOPBACK;
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	if( loop->msgs[i].size < (int)length )
 	{
 		// free first: realloc would copy the old message for nothing
@@ -1503,12 +1507,14 @@ static int NET_Isocket( const char *net_interface, int port, qboolean multicast 
 		return INVALID_SOCKET;
 	}
 
+#ifdef IP_MULTICAST_LOOP // lwIP on PS2 is built without IGMP
 	if( Sys_CheckParm( "-loopback" ))
 	{
 		optval = 1;
 		if( NET_IsSocketError( setsockopt( net_socket, IPPROTO_IP, IP_MULTICAST_LOOP, (const char *)&optval, sizeof( optval )) ) )
 			Con_DPrintf( S_WARN "NET_UDsocket: port %d setsockopt IP_MULTICAST_LOOP: %s\n", port, NET_ErrorString( ));
 	}
+#endif
 
 	return net_socket;
 }
@@ -1727,6 +1733,16 @@ void NET_ClearLagData( qboolean bClient, qboolean bServer )
 	if( bServer ) NET_ClearLaggedList( &net.lagdata[NS_SERVER] );
 }
 
+#if XASH_PS2
+static void NET_PS2Apply_f( void )
+{
+	int PS2_NetConfig( int dhcp, const char *ip, const char *mask, const char *gw );
+	if( !PS2_NetConfig( Cvar_VariableInteger( "net_dhcp" ), Cvar_VariableString( "net_ip" ),
+		Cvar_VariableString( "net_mask" ), Cvar_VariableString( "net_gw" )))
+		Con_Printf( S_ERROR "net_apply: no network adapter or bad address\n" );
+}
+#endif
+
 /*
 ====================
 NET_Init
@@ -1792,6 +1808,18 @@ void NET_Init( void )
 	{
 		void PSP_NetInit( void );
 		PSP_NetInit(); // adhoc_host / adhoc_join
+	}
+#elif XASH_PS2
+	{
+		int PS2_NetInit( void );
+		if( !PS2_NetInit( )) // network adapter + DHCP
+			net.allow_ip = false;
+		// set from the Join Server menu, applied by net_apply before connect
+		Cvar_Get( "net_dhcp", "1", FCVAR_ARCHIVE, "1: get the address by DHCP, 0: use net_ip/net_mask/net_gw" );
+		Cvar_Get( "net_ip", "192.168.1.50", FCVAR_ARCHIVE, "static address when net_dhcp is 0" );
+		Cvar_Get( "net_mask", "255.255.255.0", FCVAR_ARCHIVE, "static netmask when net_dhcp is 0" );
+		Cvar_Get( "net_gw", "192.168.1.1", FCVAR_ARCHIVE, "static gateway when net_dhcp is 0" );
+		Cmd_AddCommand( "net_apply", NET_PS2Apply_f, "apply net_dhcp, net_ip, net_mask and net_gw" );
 	}
 #endif
 }

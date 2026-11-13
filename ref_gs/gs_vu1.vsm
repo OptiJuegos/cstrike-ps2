@@ -1,0 +1,750 @@
+; VU1 triangle program for ref_gs/gs_gu.c.
+;
+; Input, written by VIF1 UNPACK (QW = quadword address in VU1 data memory):
+;   0-3   model-view-projection, one column per QW
+;   4     screen scale: half width, -half height, z scale
+;   5     screen offset: x, y, z
+;   6     guard band scale for the CLIP test
+;   7     slow path: x third vertex of the triangle, y end of primitive, z strip parity;
+;         w end of the open output packet
+;   8     x = primitives, y = cull mode (0 none, 1 keep negative area, 2 keep positive),
+;         z = world batch, w = pass (0 first, the program writes 1 for the second)
+;   9     GIF tag for triangles: PACKED, ST RGBAQ XYZ2, NLOOP is written here
+;   10-14 clip planes
+;   16-296 primitives, each a GIF tag with NLOOP = vertices and w = kind
+;         (0 list, 1 fan, 2 strip), then 3 QW per vertex: position, s t, color as integers.
+;         Kind 3 is a register write for the second pass: an A+D tag and its data QW.
+;   297-303 world batch only: A+D packets that open (297-300) and close (301-303)
+;         the second pass
+;
+; Fans and strips reach the GS as they are, so each vertex is transformed once.
+; A primitive with a vertex to clip, and any list, goes through triangle by triangle.
+;
+; A world batch runs twice over the same input: first the texture with s t in xy,
+; then the lightmap with its s t, which the EE wrote in zw, in GS context 2.
+;
+; 304-351 two polygon lists used while clipping.
+; 352-687 and 688-1023 output packets: the previous one may still be going out
+; through XGKICK while the next one is filled.
+;
+; A branch reads an integer register before the previous instruction has
+; written it, and MAC or CLIP flags are readable 4 cycles after the operation.
+; That is why NOPs sit before branches and flag reads.
+
+		.vu
+		.align 4
+		.global	VU1Gs_CodeStart
+		.global	VU1Gs_CodeEnd
+VU1Gs_CodeStart:
+; PC 0: MSCAL 0 once at startup
+	NOP		iaddiu	VI15,VI00,0
+	NOP[E]		NOP
+	NOP		NOP
+; PC 3: MSCAL 3 per batch
+	NOP		lq	VF01,0(VI00)
+	NOP		lq	VF02,1(VI00)
+	NOP		lq	VF03,2(VI00)
+	NOP		lq	VF04,3(VI00)
+	NOP		lq	VF05,4(VI00)
+	NOP		lq	VF06,5(VI00)
+	NOP		lq	VF07,6(VI00)
+	NOP		lq	VF08,9(VI00)
+	NOP		ilw.x	VI12,8(VI00)
+	NOP		ilw.y	VI14,8(VI00)
+	NOP		iaddiu	VI10,VI00,16
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		bal	VI07,begin_out
+	NOP		NOP
+
+prim_loop:
+	NOP		NOP
+	NOP		ibeq	VI12,VI00,done
+	NOP		NOP
+
+	NOP		lq	VF09,0(VI10)
+	NOP		ilw.x	VI03,0(VI10)
+	NOP		ilw.w	VI04,0(VI10)
+	NOP		iaddiu	VI02,VI10,1
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		isubiu	VI01,VI04,3
+	NOP		iadd	VI05,VI03,VI03
+	NOP		ibeq	VI01,VI00,state_prim
+	NOP		NOP
+	NOP		iadd	VI05,VI05,VI03
+	NOP		iadd	VI03,VI02,VI05
+	NOP		NOP
+	NOP		ibeq	VI04,VI00,slow_prim	; a list has no shared vertices
+	NOP		NOP
+
+	; tag + vertices must fit in the output packet
+	NOP		iaddiu	VI01,VI05,1
+	NOP		bal	VI09,need_room
+	NOP		NOP
+fast_room:
+	NOP		iaddiu	VI09,VI11,0
+	NOP		sq	VF09,0(VI11)
+	NOP		iaddiu	VI11,VI11,1
+	NOP		iaddiu	VI08,VI00,2
+	; VI05 = sign bit of a triangle that stays
+	NOP		iaddiu	VI05,VI00,0
+	NOP		isubiu	VI01,VI14,1
+	NOP		NOP
+	NOP		ibne	VI01,VI00,fast_vertex
+	NOP		NOP
+	NOP		iaddiu	VI05,VI00,0x20
+
+fast_vertex:
+	NOP		lq	VF10,0(VI02)
+	NOP		lq	VF11,1(VI02)
+	NOP		lq	VF12,2(VI02)
+	mulax		ACC,VF01,VF10x		NOP
+	madday		ACC,VF02,VF10y		NOP
+	maddaz		ACC,VF03,VF10z		NOP
+	maddw		VF19,VF04,VF00w		NOP
+	mul.xyz		VF20,VF19,VF07		NOP
+	clipw.xyz	VF20xyz,VF19w		NOP
+	NOP		div	Q,VF00w,VF19w
+	NOP		waitq
+	mulq.xyz	VF27,VF19,Q		NOP
+	mulq.xy		VF28,VF11,Q		NOP
+	addq.z		VF28,VF00,Q		NOP
+	mul.xyz		VF27,VF27,VF05		NOP
+	add.xyz		VF27,VF27,VF06		NOP
+	maxx.z		VF27,VF27,VF00x		NOP
+	NOP		loi	65535.0
+	minii.z		VF27,VF27,I		NOP
+	ftoi4.xy	VF29,VF27		NOP
+	ftoi0.z		VF29,VF27		NOP
+	mulx.w		VF29,VF00,VF00x		NOP
+	; x+ x- y+ y- z-; far is clamped above, not clipped
+	NOP		fcand	VI01,0x2F
+	NOP		NOP
+	NOP		ibne	VI01,VI00,fast_fail
+	NOP		NOP
+	NOP		sq	VF28,0(VI11)
+	NOP		sq	VF12,1(VI11)
+	NOP		sq	VF29,2(VI11)
+
+	NOP		NOP
+	NOP		ibeq	VI14,VI00,fast_next
+	NOP		NOP
+	NOP		ibeq	VI08,VI00,fast_cull
+	NOP		NOP
+	; the first two vertices draw nothing
+	NOP		isubiu	VI08,VI08,1
+	NOP		move.xyzw	VF22,VF23
+	NOP		move.xyzw	VF23,VF27
+	NOP		b	fast_next
+	NOP		NOP
+
+fast_cull:
+	; screen area, sign in MAC bit S_z
+	sub.xy		VF30,VF23,VF22		NOP
+	sub.xy		VF31,VF27,VF22		NOP
+	opmula.xyz	ACC,VF30,VF31		NOP
+	opmsub.xyz	VF30,VF31,VF30		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		iaddiu	VI01,VI00,0x20
+	NOP		fmand	VI01,VI01
+	NOP		NOP
+	NOP		ibeq	VI01,VI05,fast_keep
+	NOP		NOP
+	; ADC: the vertex enters the GS queue without drawing its triangle
+	NOP		iaddiu	VI01,VI00,0x7fff
+	NOP		iaddiu	VI01,VI01,1
+	NOP		isw.w	VI01,2(VI11)
+fast_keep:
+	NOP		isubiu	VI01,VI04,1
+	NOP		NOP
+	NOP		ibeq	VI01,VI00,fast_fan
+	NOP		NOP
+	; strip: the next triangle has the other winding
+	NOP		move.xyzw	VF22,VF23
+	NOP		iaddiu	VI01,VI00,0x20
+	NOP		isub	VI05,VI01,VI05
+fast_fan:
+	NOP		move.xyzw	VF23,VF27
+
+fast_next:
+	NOP		iaddiu	VI11,VI11,3
+	NOP		iaddiu	VI02,VI02,3
+	NOP		NOP
+	NOP		ibne	VI02,VI03,fast_vertex
+	NOP		NOP
+	NOP		iaddiu	VI06,VI09,0
+	NOP		iaddiu	VI10,VI03,0
+	NOP		isubiu	VI12,VI12,1
+	NOP		NOP
+	NOP		b	prim_loop
+	NOP		NOP
+
+; A vertex needs clipping: drop what this primitive wrote and redo it by triangles.
+fast_fail:
+	NOP		iaddiu	VI11,VI09,0
+
+slow_prim:
+	; the tag and a clipped triangle must fit
+	NOP		iaddiu	VI01,VI00,37
+	NOP		bal	VI09,need_room
+	NOP		NOP
+	NOP		bal	VI07,open_triangles
+	NOP		NOP
+	NOP		ilw.x	VI03,0(VI10)
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		iadd	VI05,VI03,VI03
+	NOP		iadd	VI05,VI05,VI03
+	NOP		iaddiu	VI02,VI10,1
+	NOP		iadd	VI03,VI02,VI05
+	NOP		iaddiu	VI02,VI02,6
+	NOP		isw.x	VI02,7(VI00)
+	NOP		isw.y	VI03,7(VI00)
+	NOP		isw.z	VI00,7(VI00)
+
+next_triangle:
+	NOP		ilw.x	VI02,7(VI00)
+	NOP		ilw.y	VI03,7(VI00)
+	NOP		ilw.w	VI04,0(VI10)
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		isub	VI01,VI02,VI03
+	NOP		NOP
+	NOP		ibgez	VI01,slow_done
+	NOP		NOP
+
+	; VI05 VI03 VI02 = the three vertices, VI01 = third vertex of the next triangle
+	NOP		isubiu	VI05,VI02,6
+	NOP		isubiu	VI03,VI02,3
+	NOP		iaddiu	VI01,VI02,9
+	NOP		ibeq	VI04,VI00,slow_store
+	NOP		NOP
+	NOP		iaddiu	VI01,VI02,3
+	NOP		isubiu	VI04,VI04,1
+	NOP		NOP
+	NOP		ibne	VI04,VI00,slow_strip
+	NOP		NOP
+	NOP		iaddiu	VI05,VI10,1
+	NOP		b	slow_store
+	NOP		NOP
+slow_strip:
+	NOP		ilw.z	VI04,7(VI00)
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		isubiu	VI08,VI04,1
+	NOP		isub	VI08,VI00,VI08
+	NOP		isw.z	VI08,7(VI00)
+	NOP		ibeq	VI04,VI00,slow_store
+	NOP		NOP
+	NOP		isubiu	VI05,VI02,3
+	NOP		isubiu	VI03,VI02,6
+slow_store:
+	NOP		isw.x	VI01,7(VI00)
+
+	NOP		lq	VF10,0(VI05)
+	NOP		lq	VF11,1(VI05)
+	NOP		lq	VF12,2(VI05)
+	NOP		lq	VF13,0(VI03)
+	NOP		lq	VF14,1(VI03)
+	NOP		lq	VF15,2(VI03)
+	NOP		lq	VF16,0(VI02)
+	NOP		lq	VF17,1(VI02)
+	NOP		lq	VF18,2(VI02)
+
+	mulax		ACC,VF01,VF10x		NOP
+	madday		ACC,VF02,VF10y		NOP
+	maddaz		ACC,VF03,VF10z		NOP
+	maddw		VF19,VF04,VF00w		NOP
+	mulax		ACC,VF01,VF13x		NOP
+	madday		ACC,VF02,VF13y		NOP
+	maddaz		ACC,VF03,VF13z		NOP
+	maddw		VF20,VF04,VF00w		NOP
+	mulax		ACC,VF01,VF16x		NOP
+	madday		ACC,VF02,VF16y		NOP
+	maddaz		ACC,VF03,VF16z		NOP
+	maddw		VF21,VF04,VF00w		NOP
+
+	mul.xyz		VF22,VF19,VF07		NOP
+	mul.xyz		VF23,VF20,VF07		NOP
+	mul.xyz		VF24,VF21,VF07		NOP
+	clipw.xyz	VF22xyz,VF19w		NOP
+	clipw.xyz	VF23xyz,VF20w		NOP
+	clipw.xyz	VF24xyz,VF21w		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	; x+ x- y+ y- z- of the three vertices; far is clamped later, not clipped
+	NOP		fcand	VI01,0x2FBEF
+	NOP		NOP
+	NOP		ibne	VI01,VI00,clip_triangle
+	NOP		NOP
+
+	NOP		bal	VI05,emit_triangle
+	NOP		NOP
+	NOP		b	next_triangle
+	NOP		NOP
+
+slow_done:
+	NOP		isw.x	VI13,0(VI06)
+	NOP		iaddiu	VI10,VI03,0
+	NOP		isubiu	VI12,VI12,1
+	NOP		NOP
+	NOP		b	prim_loop
+	NOP		NOP
+
+; A register write for the second pass; the first pass skips it.
+state_prim:
+	NOP		ilw.w	VI01,8(VI00)
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		ibeq	VI01,VI00,state_next
+	NOP		NOP
+	NOP		iaddiu	VI01,VI00,2
+	NOP		bal	VI09,need_room
+	NOP		NOP
+	NOP		lq	VF10,1(VI10)
+	NOP		iaddiu	VI06,VI11,0
+	NOP		sq	VF09,0(VI11)
+	NOP		sq	VF10,1(VI11)
+	NOP		iaddiu	VI11,VI11,2
+state_next:
+	NOP		iaddiu	VI10,VI10,2
+	NOP		isubiu	VI12,VI12,1
+	NOP		NOP
+	NOP		b	prim_loop
+	NOP		NOP
+
+done:
+	NOP		ilw.z	VI01,8(VI00)
+	NOP		ilw.w	VI02,8(VI00)
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		ibeq	VI01,VI00,finish
+	NOP		NOP
+	NOP		ibne	VI02,VI00,world_end
+	NOP		NOP
+
+	; world batch: the same primitives again, lightmap s t in xy and context 2
+	NOP		iaddiu	VI02,VI00,1
+	NOP		isw.w	VI02,8(VI00)
+	NOP		bal	VI09,swap_st
+	NOP		NOP
+	NOP		iaddiu	VI01,VI00,4
+	NOP		bal	VI09,need_room
+	NOP		NOP
+	NOP		iaddiu	VI06,VI11,0
+	NOP		lq	VF10,297(VI00)
+	NOP		sq	VF10,0(VI11)
+	NOP		lq	VF10,298(VI00)
+	NOP		sq	VF10,1(VI11)
+	NOP		lq	VF10,299(VI00)
+	NOP		sq	VF10,2(VI11)
+	NOP		lq	VF10,300(VI00)
+	NOP		sq	VF10,3(VI11)
+	NOP		iaddiu	VI11,VI11,4
+	NOP		ilw.x	VI12,8(VI00)
+	NOP		iaddiu	VI10,VI00,16
+	NOP		b	prim_loop
+	NOP		NOP
+
+	; context 1 again, and its palette back in the CLUT buffer
+world_end:
+	NOP		iaddiu	VI01,VI00,3
+	NOP		bal	VI09,need_room
+	NOP		NOP
+	NOP		iaddiu	VI06,VI11,0
+	NOP		lq	VF10,301(VI00)
+	NOP		sq	VF10,0(VI11)
+	NOP		lq	VF10,302(VI00)
+	NOP		sq	VF10,1(VI11)
+	NOP		lq	VF10,303(VI00)
+	NOP		sq	VF10,2(VI11)
+	NOP		iaddiu	VI11,VI11,3
+
+finish:
+	NOP		bal	VI07,flush_out
+	NOP		NOP
+	NOP[E]		NOP
+	NOP		NOP
+
+; Moves the lightmap s t of every vertex from zw to xy. Uses VI01-VI04 and VI12,
+; returns through VI09.
+swap_st:
+	NOP		ilw.x	VI12,8(VI00)
+	NOP		iaddiu	VI02,VI00,16
+swap_prim:
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		ibeq	VI12,VI00,swap_done
+	NOP		NOP
+	NOP		ilw.x	VI03,0(VI02)
+	NOP		ilw.w	VI04,0(VI02)
+	NOP		isubiu	VI12,VI12,1
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		isubiu	VI04,VI04,3
+	NOP		iaddiu	VI01,VI02,2	; s t of the first vertex
+	NOP		ibeq	VI04,VI00,swap_state
+	NOP		NOP
+	NOP		iadd	VI04,VI03,VI03
+	NOP		iadd	VI04,VI04,VI03
+	NOP		iadd	VI02,VI02,VI04
+	NOP		iaddiu	VI02,VI02,1	; next primitive
+	NOP		iaddiu	VI04,VI02,1	; s t walk ends here
+swap_vertex:
+	NOP		lq	VF10,0(VI01)
+	NOP		mr32.xyzw	VF11,VF10
+	NOP		mr32.xyzw	VF10,VF11
+	NOP		sq	VF10,0(VI01)
+	NOP		iaddiu	VI01,VI01,3
+	NOP		NOP
+	NOP		ibne	VI01,VI04,swap_vertex
+	NOP		NOP
+	NOP		b	swap_prim
+	NOP		NOP
+swap_state:
+	NOP		iaddiu	VI02,VI02,2
+	NOP		b	swap_prim
+	NOP		NOP
+swap_done:
+	NOP		jr	VI09
+	NOP		NOP
+
+; ---------- output packet ----------
+
+; VI06 = last GIF tag of the packet, VI11 = write position, VI13 = vertices of an
+; open triangle tag. VI15 picks the packet; the other one may still be going out.
+; 7.w holds the end of the open packet.
+begin_out:
+	NOP		iaddiu	VI11,VI00,352
+	NOP		iaddiu	VI01,VI00,688
+	NOP		ibeq	VI15,VI00,begin_out_a
+	NOP		NOP
+	NOP		iaddiu	VI11,VI00,688
+	NOP		iaddiu	VI01,VI00,1024
+begin_out_a:
+	NOP		isw.w	VI01,7(VI00)
+	NOP		jr	VI07
+	NOP		NOP
+
+; Sends the packet unless VI01 more QW fit in it. Uses VI01 and VI08, returns through VI09.
+need_room:
+	NOP		ilw.w	VI08,7(VI00)
+	NOP		iadd	VI01,VI11,VI01
+	NOP		NOP
+	NOP		NOP
+	NOP		isub	VI01,VI08,VI01
+	NOP		NOP
+	NOP		ibgez	VI01,need_room_ok
+	NOP		NOP
+	NOP		bal	VI07,flush_out
+	NOP		NOP
+need_room_ok:
+	NOP		jr	VI09
+	NOP		NOP
+
+open_triangles:
+	NOP		iaddiu	VI06,VI11,0
+	NOP		sq	VF08,0(VI11)
+	NOP		iaddiu	VI11,VI11,1
+	NOP		iaddiu	VI13,VI00,0
+	NOP		NOP
+	NOP		jr	VI07
+	NOP		NOP
+
+; Sends the packet if it has anything and opens the other one. Uses VI01 and VI08.
+flush_out:
+	NOP		ilw.w	VI01,7(VI00)
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		isubiu	VI01,VI01,336	; start of the packet
+	NOP		NOP
+	NOP		ibeq	VI11,VI01,flush_out_empty
+	NOP		NOP
+	NOP		ilw.x	VI08,0(VI06)
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		iaddiu	VI08,VI08,0x7fff
+	NOP		iaddiu	VI08,VI08,1		; EOP
+	NOP		isw.x	VI08,0(VI06)
+	NOP		xgkick	VI01
+	NOP		iaddiu	VI01,VI00,1
+	NOP		isub	VI15,VI01,VI15
+	NOP		NOP
+	NOP		b	begin_out
+	NOP		NOP
+flush_out_empty:
+	NOP		NOP
+	NOP		jr	VI07
+	NOP		NOP
+
+; ---------- one triangle ----------
+
+; In: VF19-21 clip positions, VF11 VF14 VF17 s t, VF12 VF15 VF18 colors.
+; Keeps VI02, VI04 and VI09. Returns through VI05.
+emit_triangle:
+	NOP		ilw.w	VI01,7(VI00)
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		isubiu	VI01,VI01,16
+	NOP		isub	VI01,VI11,VI01
+	NOP		NOP
+	NOP		ibltz	VI01,emit_has_room
+	NOP		NOP
+	NOP		isw.x	VI13,0(VI06)
+	NOP		bal	VI07,flush_out
+	NOP		NOP
+	NOP		bal	VI07,open_triangles
+	NOP		NOP
+emit_has_room:
+	NOP		move.xyzw	VF25,VF19
+	NOP		move.xyzw	VF26,VF11
+	NOP		bal	VI08,project
+	NOP		NOP
+	NOP		move.xyzw	VF22,VF27
+	NOP		sq	VF28,0(VI11)
+	NOP		sq	VF12,1(VI11)
+	NOP		sq	VF29,2(VI11)
+
+	NOP		move.xyzw	VF25,VF20
+	NOP		move.xyzw	VF26,VF14
+	NOP		bal	VI08,project
+	NOP		NOP
+	NOP		move.xyzw	VF23,VF27
+	NOP		sq	VF28,3(VI11)
+	NOP		sq	VF15,4(VI11)
+	NOP		sq	VF29,5(VI11)
+
+	NOP		move.xyzw	VF25,VF21
+	NOP		move.xyzw	VF26,VF17
+	NOP		bal	VI08,project
+	NOP		NOP
+	NOP		sq	VF28,6(VI11)
+	NOP		sq	VF18,7(VI11)
+	NOP		sq	VF29,8(VI11)
+
+	NOP		NOP
+	NOP		ibeq	VI14,VI00,emit_keep
+	NOP		NOP
+
+	; screen area, sign in MAC bit S_z
+	sub.xy		VF30,VF23,VF22		NOP
+	sub.xy		VF31,VF27,VF22		NOP
+	opmula.xyz	ACC,VF30,VF31		NOP
+	opmsub.xyz	VF30,VF31,VF30		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		iaddiu	VI01,VI00,0x20
+	NOP		fmand	VI01,VI01
+	NOP		isubiu	VI03,VI14,1
+	NOP		NOP
+	NOP		ibeq	VI03,VI00,emit_keep_negative
+	NOP		NOP
+	NOP		ibeq	VI01,VI00,emit_keep
+	NOP		NOP
+	NOP		jr	VI05
+	NOP		NOP
+emit_keep_negative:
+	NOP		ibne	VI01,VI00,emit_keep
+	NOP		NOP
+	NOP		jr	VI05
+	NOP		NOP
+emit_keep:
+	NOP		iaddiu	VI11,VI11,9
+	NOP		iaddiu	VI13,VI13,3
+	NOP		NOP
+	NOP		jr	VI05
+	NOP		NOP
+
+; In: VF25 clip position, VF26 s t.
+; Out: VF27 screen floats, VF28 ST packed with Q, VF29 XYZ2 packed.
+project:
+	NOP		div	Q,VF00w,VF25w
+	NOP		waitq
+	mulq.xyz	VF27,VF25,Q		NOP
+	mulq.xy		VF28,VF26,Q		NOP
+	addq.z		VF28,VF00,Q		NOP
+	mul.xyz		VF27,VF27,VF05		NOP
+	add.xyz		VF27,VF27,VF06		NOP
+	maxx.z		VF27,VF27,VF00x		NOP
+	NOP		loi	65535.0
+	minii.z		VF27,VF27,I		NOP
+	ftoi4.xy	VF29,VF27		NOP
+	ftoi0.z		VF29,VF27		NOP
+	mulx.w		VF29,VF00,VF00x		NOP
+	NOP		jr	VI08
+	NOP		NOP
+
+; ---------- clipping ----------
+
+; Sutherland-Hodgman against the 5 planes, then a fan of triangles.
+; VI02 current vertex, VI03 output, VI04 end of input list, VI05 previous side,
+; VI07 plane, VI09 input list. VF19-22 hold the previous vertex and distance.
+clip_triangle:
+	itof0		VF12,VF12		NOP
+	itof0		VF15,VF15		NOP
+	itof0		VF18,VF18		NOP
+	NOP		iaddiu	VI09,VI00,304
+	NOP		sq	VF19,0(VI09)
+	NOP		sq	VF11,1(VI09)
+	NOP		sq	VF12,2(VI09)
+	NOP		sq	VF20,3(VI09)
+	NOP		sq	VF14,4(VI09)
+	NOP		sq	VF15,5(VI09)
+	NOP		sq	VF21,6(VI09)
+	NOP		sq	VF17,7(VI09)
+	NOP		sq	VF18,8(VI09)
+	NOP		iaddiu	VI04,VI09,9
+	NOP		iaddiu	VI07,VI00,10
+
+clip_plane:
+	NOP		lq	VF30,0(VI07)
+	NOP		iaddiu	VI03,VI00,304
+	NOP		isubiu	VI01,VI09,304
+	NOP		NOP
+	NOP		ibne	VI01,VI00,clip_output_set
+	NOP		NOP
+	NOP		iaddiu	VI03,VI00,328
+clip_output_set:
+	NOP		iaddiu	VI02,VI09,0
+	NOP		isubiu	VI01,VI04,3
+	NOP		lq	VF19,0(VI01)
+	NOP		lq	VF20,1(VI01)
+	NOP		lq	VF21,2(VI01)
+	mul		VF22,VF19,VF30		NOP
+	addy.x		VF22,VF22,VF22y		NOP
+	addz.x		VF22,VF22,VF22z		NOP
+	addw.x		VF22,VF22,VF22w		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		iaddiu	VI05,VI00,0x80
+	NOP		fmand	VI05,VI05
+
+clip_vertex:
+	NOP		lq	VF23,0(VI02)
+	NOP		lq	VF24,1(VI02)
+	NOP		lq	VF25,2(VI02)
+	mul		VF26,VF23,VF30		NOP
+	addy.x		VF26,VF26,VF26y		NOP
+	addz.x		VF26,VF26,VF26z		NOP
+	addw.x		VF26,VF26,VF26w		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		iaddiu	VI01,VI00,0x80
+	NOP		fmand	VI01,VI01
+	NOP		NOP
+	NOP		ibeq	VI01,VI05,clip_no_crossing
+	NOP		NOP
+
+	; the edge crosses the plane: previous + (current - previous) * t
+	sub.x		VF27,VF22,VF26		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		div	Q,VF22x,VF27x
+	NOP		waitq
+	sub		VF27,VF23,VF19		NOP
+	mulq		VF27,VF27,Q		NOP
+	add		VF27,VF27,VF19		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		sq	VF27,0(VI03)
+	sub		VF27,VF24,VF20		NOP
+	mulq		VF27,VF27,Q		NOP
+	add		VF27,VF27,VF20		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		sq	VF27,1(VI03)
+	sub		VF27,VF25,VF21		NOP
+	mulq		VF27,VF27,Q		NOP
+	add		VF27,VF27,VF21		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		NOP
+	NOP		sq	VF27,2(VI03)
+	NOP		iaddiu	VI03,VI03,3
+
+clip_no_crossing:
+	NOP		NOP
+	NOP		ibne	VI01,VI00,clip_vertex_out
+	NOP		NOP
+	NOP		sq	VF23,0(VI03)
+	NOP		sq	VF24,1(VI03)
+	NOP		sq	VF25,2(VI03)
+	NOP		iaddiu	VI03,VI03,3
+clip_vertex_out:
+	NOP		move.xyzw	VF19,VF23
+	NOP		move.xyzw	VF20,VF24
+	NOP		move.xyzw	VF21,VF25
+	NOP		move.xyzw	VF22,VF26
+	NOP		iaddiu	VI05,VI01,0
+	NOP		iaddiu	VI02,VI02,3
+	NOP		NOP
+	NOP		ibne	VI02,VI04,clip_vertex
+	NOP		NOP
+
+	; the output list is the input of the next plane
+	NOP		isubiu	VI01,VI09,304
+	NOP		iaddiu	VI09,VI00,328
+	NOP		NOP
+	NOP		ibeq	VI01,VI00,clip_input_set
+	NOP		NOP
+	NOP		iaddiu	VI09,VI00,304
+clip_input_set:
+	NOP		iaddiu	VI04,VI03,0
+	NOP		isub	VI01,VI04,VI09
+	NOP		isubiu	VI01,VI01,9
+	NOP		NOP
+	NOP		ibltz	VI01,next_triangle	; less than 3 vertices left
+	NOP		NOP
+	NOP		iaddiu	VI07,VI07,1
+	NOP		isubiu	VI01,VI07,15
+	NOP		NOP
+	NOP		ibne	VI01,VI00,clip_plane
+	NOP		NOP
+
+	; fan: list[0], list[n], list[n + 1]
+	NOP		iaddiu	VI02,VI09,3
+clip_fan:
+	NOP		iaddiu	VI01,VI02,3
+	NOP		NOP
+	NOP		ibeq	VI01,VI04,next_triangle
+	NOP		NOP
+	NOP		lq	VF19,0(VI09)
+	NOP		lq	VF11,1(VI09)
+	NOP		lq	VF12,2(VI09)
+	NOP		lq	VF20,0(VI02)
+	NOP		lq	VF14,1(VI02)
+	NOP		lq	VF15,2(VI02)
+	NOP		lq	VF21,3(VI02)
+	NOP		lq	VF17,4(VI02)
+	NOP		lq	VF18,5(VI02)
+	ftoi0		VF12,VF12		NOP
+	ftoi0		VF15,VF15		NOP
+	ftoi0		VF18,VF18		NOP
+	NOP		bal	VI05,emit_triangle
+	NOP		NOP
+	NOP		iaddiu	VI02,VI02,3
+	NOP		NOP
+	NOP		b	clip_fan
+	NOP		NOP
+
+		.align 4
+VU1Gs_CodeEnd:

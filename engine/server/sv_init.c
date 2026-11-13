@@ -17,7 +17,7 @@ GNU General Public License for more details.
 #include "server.h"
 #include "net_encode.h"
 #include "library.h"
-#if XASH_LOW_MEMORY != 2
+#if !( XASH_LOW_MEMORY == 2 && XASH_PS2 )
 int SV_UPDATE_BACKUP = SINGLEPLAYER_BACKUP;
 #endif
 server_t		sv;	// local server
@@ -31,19 +31,44 @@ SV_AddResource
 generic method to put the resources into array
 ================
 */
-static void SV_AddResource( resourcetype_t type, const char *name, int size, byte flags, int index )
+static resource_t *SV_AddResource( resourcetype_t type, const char *name, int size, byte flags, int index )
 {
-	resource_t	*pResource = &sv.resources[sv.num_resources];
+	resource_t	*pResource;
 
-	if( sv.num_resources >= MAX_RESOURCES )
-		Host_Error( "MAX_RESOURCES limit exceeded (%d)\n", MAX_RESOURCES );
-	sv.num_resources++;
+	if( sv.num_resources >= sv.max_resources )
+	{
+		// a map uses a few hundred of the MAX_RESOURCES slots: grow on demand
+		// instead of keeping the whole static table (~140 KB at 1024 slots)
+		if( sv.max_resources >= MAX_RESOURCES )
+			Host_Error( "MAX_RESOURCES limit exceeded (%d)\n", MAX_RESOURCES );
+		sv.max_resources = Q_min( sv.max_resources + 128, MAX_RESOURCES );
+		sv.resources = Mem_Realloc( host.mempool, sv.resources, sv.max_resources * sizeof( resource_t ));
+	}
+	pResource = &sv.resources[sv.num_resources++];
+	memset( pResource, 0, sizeof( *pResource ));
 
 	Q_strncpy( pResource->szFileName, name, sizeof( pResource->szFileName ));
 	pResource->nDownloadSize = size;
 	pResource->ucFlags = flags;
 	pResource->nIndex = index;
 	pResource->type = type;
+
+	return pResource;
+}
+
+/*
+================
+SV_FreeResources
+
+the table belongs to the level, free it before the server state is wiped
+================
+*/
+void SV_FreeResources( void )
+{
+	if( sv.resources )
+		Mem_Free( sv.resources );
+	sv.resources = NULL;
+	sv.num_resources = sv.max_resources = 0;
 }
 
 /*
@@ -55,7 +80,7 @@ hot precache on a flying
 */
 void SV_SendSingleResource( const char *name, resourcetype_t type, int index, byte flags )
 {
-	resource_t	*pResource = &sv.resources[sv.num_resources];
+	resource_t	*pResource;
 	int		nSize = 0;
 
 	if( !COM_CheckString( name ))
@@ -74,7 +99,7 @@ void SV_SendSingleResource( const char *name, resourcetype_t type, int index, by
 		break;
 	}
 
-	SV_AddResource( type, name, nSize, flags, index );
+	pResource = SV_AddResource( type, name, nSize, flags, index );
 	MSG_BeginServerCmd( &sv.reliable_datagram, svc_resource );
 	SV_SendResource( pResource, &sv.reliable_datagram );
 }
@@ -767,12 +792,12 @@ void SV_SetupClients( void )
 
 	// feedback for cvar
 	Cvar_FullSet( "maxplayers", va( "%d", svs.maxclients ), FCVAR_LATCH );
-#if XASH_LOW_MEMORY != 2
+#if !( XASH_LOW_MEMORY == 2 && XASH_PS2 )
 	SV_UPDATE_BACKUP = ( svs.maxclients == 1 ) ? SINGLEPLAYER_BACKUP : MULTIPLAYER_BACKUP;
 #endif
 
 	svs.clients = Z_Realloc( svs.clients, sizeof( sv_client_t ) * svs.maxclients );
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	// the pool only holds the entity snapshots sent to real players, bots
 	// get none: size it for 2 (local player + the one ad-hoc player the
 	// menu allows), not for every slot. Was 1.7 MB with 10 players. A delta
@@ -885,6 +910,15 @@ qboolean SV_SpawnServer( const char *mapname, const char *startspot, qboolean ba
 	if( !SV_InitGame( ))
 		return false;
 
+#if XASH_PS2
+	{
+		void UI_PS2ReleaseBackground( void ) __attribute__(( weak )); // absent without MainUI
+
+		if( UI_PS2ReleaseBackground )
+			UI_PS2ReleaseBackground();
+	}
+#endif
+
 	Log_Open();
 	Log_Printf( "Loading map \"%s\"\n", mapname );
 	Log_PrintServerVars();
@@ -905,6 +939,7 @@ qboolean SV_SpawnServer( const char *mapname, const char *startspot, qboolean ba
 		Con_DPrintf( "Spawn Server: %s\n", mapname );
 	}
 
+	SV_FreeResources();
 	memset( &sv, 0, sizeof( sv ));	// wipe the entire per-level structure
 	sv.time = svgame.globals->time = 1.0f;	// server spawn time it's always 1.0 second
 	sv.background = background;
@@ -1052,8 +1087,18 @@ void SV_ExecLoadLevel( void )
 	SV_SetStringArrayMode( false );
 	if( SV_SpawnServer( GameState->levelName, NULL, GameState->backgroundMap ))
 	{
+	#if XASH_PS2
+		printf( "[XASH-PS2] STAGE=SV_SPAWN_ENTITIES_BEGIN\n" );
+	#endif
 		SV_SpawnEntities( GameState->levelName );
+	#if XASH_PS2
+		printf( "[XASH-PS2] STAGE=SV_SPAWN_ENTITIES_DONE\n" );
+		printf( "[XASH-PS2] STAGE=SV_ACTIVATE_BEGIN\n" );
+	#endif
 		SV_ActivateServer( true );
+	#if XASH_PS2
+		printf( "[XASH-PS2] STAGE=SV_ACTIVATE_DONE\n" );
+	#endif
 	}
 }
 

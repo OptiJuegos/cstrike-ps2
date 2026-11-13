@@ -397,7 +397,7 @@ static void SPR_AdjustSize( float *x, float *y, float *w, float *h )
 
 	// scale for screen sizes
 	xscale = refState.width / (float)clgame.scrInfo.iWidth;
-	yscale = refState.height / (float)clgame.scrInfo.iHeight;
+	yscale = CL_HUD_HEIGHT / (float)clgame.scrInfo.iHeight;
 
 	if( x ) *x *= xscale;
 	if( y ) *y *= yscale;
@@ -418,7 +418,7 @@ static void SPR_AdjustSizei( int *x, int *y, int *w, int *h )
 
 	// scale for screen sizes
 	xscale = refState.width / (float)clgame.scrInfo.iWidth;
-	yscale = refState.height / (float)clgame.scrInfo.iHeight;
+	yscale = CL_HUD_HEIGHT / (float)clgame.scrInfo.iHeight;
 
 	if( x ) *x *= xscale;
 	if( y ) *y *= yscale;
@@ -949,7 +949,7 @@ void CL_DrawCrosshair( void )
 
 	// back to logical sizes
 	xscale = (float)clgame.scrInfo.iWidth / refState.width;
-	yscale = (float)clgame.scrInfo.iHeight / refState.height;
+	yscale = (float)clgame.scrInfo.iHeight / CL_HUD_HEIGHT;
 
 	x *= xscale;
 	y *= yscale;
@@ -1118,13 +1118,23 @@ void CL_InitEdicts( void )
 	Assert( clgame.entities == NULL );
 
 	if( !clgame.mempool ) return; // Host_Error without client
-#if XASH_LOW_MEMORY != 2
-	CL_UPDATE_BACKUP = ( cl.maxclients <= 1 ) ? SINGLEPLAYER_BACKUP : MULTIPLAYER_BACKUP;
-#endif
+	// a local server is loopback, no latency to cover: bot games keep the small history
+	CL_SetUpdateBackup(( cl.maxclients <= 1 || SV_Active( )) ? SINGLEPLAYER_BACKUP : MULTIPLAYER_BACKUP );
 	cls.num_client_entities = CL_UPDATE_BACKUP * NUM_PACKET_ENTITIES;
 	cls.packet_entities = Mem_Realloc( clgame.mempool, cls.packet_entities, sizeof( entity_state_t ) * cls.num_client_entities );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_EDICT_ALLOC count=%d stride=%u bytes=%u history=%d\n",
+		clgame.maxEntities, (unsigned)sizeof( cl_entity_t ),
+		(unsigned)(sizeof( cl_entity_t ) * clgame.maxEntities), HISTORY_MAX );
+	#endif
 	clgame.entities = Mem_Calloc( clgame.mempool, sizeof( cl_entity_t ) * clgame.maxEntities );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_EDICT_ALLOC_DONE\n" );
+	#endif
 	clgame.static_entities = Mem_Calloc( clgame.mempool, sizeof( cl_entity_t ) * MAX_STATIC_ENTITIES );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_STATIC_ALLOC_DONE count=%d\n", MAX_STATIC_ENTITIES );
+	#endif
 	clgame.numStatics = 0;
 
 	if(( clgame.maxRemapInfos - 1 ) != clgame.maxEntities )
@@ -1135,6 +1145,44 @@ void CL_InitEdicts( void )
 	}
 
 	ref.dllFuncs.R_ProcessEntData( true );
+}
+
+// local games use SINGLEPLAYER_BACKUP slots: keep only those static and
+// allocate the larger online history when it is needed
+static frame_t		cl_frames_local[SINGLEPLAYER_BACKUP];
+static local_state_t	cl_predicted_local[SINGLEPLAYER_BACKUP];
+
+void CL_FreeUpdateFrames( void )
+{
+	if( cl.frames && cl.frames != cl_frames_local )
+	{
+		Mem_Free( cl.frames );
+		Mem_Free( cl.predicted_frames );
+	}
+	cl.frames = NULL;
+	cl.predicted_frames = NULL;
+}
+
+void CL_SetUpdateBackup( int backup )
+{
+	if( cl.frames && backup == CL_UPDATE_BACKUP )
+		return; // same history, keep its contents
+
+	CL_FreeUpdateFrames();
+	CL_UPDATE_BACKUP = backup;
+
+	if( backup <= SINGLEPLAYER_BACKUP )
+	{
+		memset( cl_frames_local, 0, sizeof( cl_frames_local ));
+		memset( cl_predicted_local, 0, sizeof( cl_predicted_local ));
+		cl.frames = cl_frames_local;
+		cl.predicted_frames = cl_predicted_local;
+	}
+	else
+	{
+		cl.frames = Mem_Calloc( clgame.mempool, sizeof( frame_t ) * backup );
+		cl.predicted_frames = Mem_Calloc( clgame.mempool, sizeof( local_state_t ) * backup );
+	}
 }
 
 void CL_FreeEdicts( void )
@@ -1232,9 +1280,17 @@ static qboolean CL_LoadHudSprite( const char *szSpriteName, model_t *m_pSprite, 
 	{
 		Mod_LoadSpriteModel( m_pSprite, buf, &loaded, texFlags );
 		ref.dllFuncs.Mod_ProcessRenderData( m_pSprite, true, buf );
+			#if XASH_PS2
+			if( !Q_strnicmp( szSpriteName, "sprites/640hud", 14 ))
+				printf( "[XASH-PS2] STAGE=CL_HUD_RENDER_RETURN name=%s loaded=%d\n", szSpriteName, loaded );
+			#endif
 	}
 
 	Mem_Free( buf );
+		#if XASH_PS2
+		if( !Q_strnicmp( szSpriteName, "sprites/640hud", 14 ))
+			printf( "[XASH-PS2] STAGE=CL_HUD_SOURCE_FREED name=%s\n", szSpriteName );
+		#endif
 
 	if( !loaded )
 	{
@@ -1653,13 +1709,13 @@ int GAME_EXPORT CL_GetScreenInfo( SCREENINFO *pscrinfo )
 	if( scale_factor && scale_factor != 1.0f)
 	{
 		clgame.scrInfo.iWidth = (float)refState.width / scale_factor;
-		clgame.scrInfo.iHeight = (float)refState.height / scale_factor;
+		clgame.scrInfo.iHeight = (float)CL_HUD_HEIGHT / scale_factor;
 		clgame.scrInfo.iFlags |= SCRINFO_STRETCHED;
 	}
 	else
 	{
 		clgame.scrInfo.iWidth = refState.width;
-		clgame.scrInfo.iHeight = refState.height;
+		clgame.scrInfo.iHeight = CL_HUD_HEIGHT;
 		clgame.scrInfo.iFlags &= ~SCRINFO_STRETCHED;
 	}
 
@@ -2781,10 +2837,14 @@ pfnGetMousePos
 */
 void GAME_EXPORT pfnGetMousePos( struct tagPOINT *ppt )
 {
+	int x, y; // Windows POINT fields are LONG
+
 	if( !ppt )
 		return;
 
-	Platform_GetMousePos( &ppt->x, &ppt->y );
+	Platform_GetMousePos( &x, &y );
+	ppt->x = x;
+	ppt->y = y;
 }
 
 /*
@@ -3746,6 +3806,12 @@ static cl_enginefunc_t gEngfuncs =
 	pfnClientCmd
 };
 
+// the same calls the client library gets, for HUDs the engine draws itself (cl_splithud.c)
+const cl_enginefunc_t *CL_EngineFuncs( void )
+{
+	return &gEngfuncs;
+}
+
 void CL_UnloadProgs( void )
 {
 	if( !clgame.hInstance ) return;
@@ -3766,6 +3832,7 @@ void CL_UnloadProgs( void )
 
 	COM_FreeLibrary( clgame.hInstance );
 	VGui_Shutdown();
+	CL_SetUpdateBackup( SINGLEPLAYER_BACKUP ); // online history lives in clgame.mempool
 	Mem_FreePool( &cls.mempool );
 	Mem_FreePool( &clgame.mempool );
 	memset( &clgame, 0, sizeof( clgame ));
@@ -3782,6 +3849,9 @@ qboolean CL_LoadProgs( const char *name )
 	qboolean			critical_exports = true;
 
 	if( clgame.hInstance ) CL_UnloadProgs();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_LOAD_BEGIN library=%s\n", name );
+	#endif
 
 	// initialize PlayerMove
 	clgame.pmove = &gpMove;
@@ -3814,6 +3884,9 @@ qboolean CL_LoadProgs( const char *name )
 
 	clgame.hInstance = COM_LoadLibrary( name, false, false );
 	if( !clgame.hInstance ) return false;
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_LIB_OPEN\n" );
+	#endif
 
 	// clear exports
 	for( func = cdll_exports; func && func->name; func++ )
@@ -3822,6 +3895,9 @@ qboolean CL_LoadProgs( const char *name )
 	// trying to get single export
 	if(( GetClientAPI = (void *)COM_GetProcAddress( clgame.hInstance, "GetClientAPI" )) != NULL )
 	{
+		#if XASH_PS2
+		printf( "[XASH-PS2] STAGE=CLIENT_EXPORT_READY\n" );
+		#endif
 		Con_Reportf( "CL_LoadProgs: found single callback export\n" );		
 
 		// trying to fill interface now
@@ -3877,6 +3953,20 @@ qboolean CL_LoadProgs( const char *name )
 			Con_Reportf( "CL_LoadProgs: failed to get address of %s proc\n", func->name );
 	}
 
+#if XASH_PS2
+	/* The original client F()/GetClientAPI table ends with
+	 * HUD_GetPlayerTeam in the slot occupied by Xash's later
+	 * HUD_GetRenderInterface extension. A non-NULL legacy pointer above
+	 * would otherwise skip the named lookup and make the engine call
+	 * HUD_GetPlayerTeam with incompatible arguments. Resolve the real
+	 * export in the static PS2 loader just as a dynamic loader would. */
+	{
+		void *renderExport = COM_GetProcAddress( clgame.hInstance, "HUD_GetRenderInterface" );
+		clgame.dllFuncs.pfnGetRenderInterface = (int (*)( int, render_api_t *, render_interface_t * ))renderExport;
+		printf( "[XASH-PS2] STAGE=CLIENT_RENDER_EXPORT_RESOLVED ptr=%p\n", renderExport );
+	}
+#endif
+
 	if( !clgame.dllFuncs.pfnInitialize( &gEngfuncs, CLDLL_INTERFACE_VERSION ))
 	{
 		COM_FreeLibrary( clgame.hInstance );
@@ -3884,6 +3974,9 @@ qboolean CL_LoadProgs( const char *name )
 		clgame.hInstance = NULL;
 		return false;
 	}
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_INITIALIZED\n" );
+	#endif
 
 	Cvar_FullSet( "host_clientloaded", "1", FCVAR_READ_ONLY );
 
@@ -3891,22 +3984,52 @@ qboolean CL_LoadProgs( const char *name )
 	clgame.maxEntities = 2; // world + localclient (have valid entities not in game)
 
 	CL_InitCDAudio( "media/cdaudio.txt" );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_CDAUDIO_READY\n" );
+	#endif
 	CL_InitTitles( "titles.txt" );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_TITLES_READY\n" );
+	#endif
 	CL_InitParticles ();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_PARTICLES_READY\n" );
+	#endif
 	CL_InitViewBeams ();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_BEAMS_READY\n" );
+	#endif
 	CL_InitTempEnts ();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_TEMPENTS_READY\n" );
+	#endif
 
 	if( !R_InitRenderAPI())	// Xash3D extension
 		Con_Reportf( S_WARN "CL_LoadProgs: couldn't get render API\n" );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_RENDER_API_READY\n" );
+	#endif
 
 	if( !Mobile_Init() ) // Xash3D FWGS extension: mobile interface
 		Con_Reportf( S_WARN "CL_LoadProgs: couldn't get mobility API\n" );
 
 	CL_InitEdicts ();		// initailize local player and world
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_EDICTS_READY\n" );
+	#endif
 	CL_InitClientMove();	// initialize pm_shared
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_MOVE_READY\n" );
+	#endif
 
 	// initialize game
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_GAME_INIT_BEGIN\n" );
+	#endif
 	clgame.dllFuncs.pfnInit();
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=CLIENT_GAME_INIT_DONE\n" );
+	#endif
 
 	ref.dllFuncs.CL_InitStudioAPI();
 

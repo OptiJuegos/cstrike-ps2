@@ -21,7 +21,7 @@ typedef enum
 	PF_BGRA_32,	// big endian RGBA (MacOS)
 	PF_RGB_24,	// uncompressed dds or another 24-bit image
 	PF_BGR_24,	// big-endian RGB (MacOS)
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	PF_RGB_332,		// 8-bit  R3 G3 B2
 	PF_RGB_5650,	// 16-bit R5 G6 B5
 	PF_RGBA_5551,	// 16-bit R5 G5 B5 A1
@@ -82,6 +82,9 @@ typedef enum
 	IMAGE_MULTILAYER	= BIT(8),		// to differentiate from 3D texture
 	IMAGE_ONEBIT_ALPHA	= BIT(9),		// binary alpha
 	IMAGE_QUAKEPAL	= BIT(10),	// image has quake1 palette
+#if XASH_PS2
+	IMAGE_BORROWED_PIXELS = BIT(11), // temporary inline Studio/sprite data; do not free the source
+#endif
 
 	// Image_Process manipulation flags
 	IMAGE_FLIP_X	= BIT(16),	// flip the image by width

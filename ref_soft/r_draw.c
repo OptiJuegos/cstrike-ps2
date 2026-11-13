@@ -72,10 +72,19 @@ void R_DrawStretchPicImplementation( int x, int y, int w, int h, int s1, int t1,
 	int				skip;
 	qboolean transparent = false;
 	pixel_t *buffer;
+	/* Reject rectangles outside the framebuffer before clipping or converting
+	 * their dimensions to unsigned loop bounds. HUD/UI images may be offscreen. */
+	if( w <= 0 || h <= 0 || x >= vid.width || y >= vid.height ||
+		(long long)x + w <= 0 || (long long)y + h <= 0 )
+		return;
+	#if XASH_PS2
+	R_PS2PrepareIndexedHud( pic );
+	#endif
 
 	if( x < 0 )
 	{
 		s1 += (-x)*(s2-s1) / w;
+		w += x;
 		x = 0;
 	}
 	if( x + w > vid.width )
@@ -89,7 +98,7 @@ void R_DrawStretchPicImplementation( int x, int y, int w, int h, int s1, int t1,
 		h = vid.height - y;
 	}
 
-	if( !pic->pixels[0] || s1 >= s2 || t1 >= t2 )
+	if( w <= 0 || h <= 0 || !pic->pixels[0] || s1 >= s2 || t1 >= t2 )
 		return;
 
 	//gEngfuncs.Con_Printf ("pixels is %p\n", pic->pixels[0] );

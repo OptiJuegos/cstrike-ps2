@@ -186,6 +186,13 @@ int SV_FindBestBaseline( sv_client_t *cl, int index, entity_state_t **baseline, 
 	int	i, bitCount;
 	int	bestfound, j;
 
+#if XASH_PS2
+	// Loopback has no network bandwidth cost. Keep the entity's own baseline
+	// instead of testing up to 63 other states merely to save packet bytes.
+	// Offset zero is already supported by the normal delta encoder/decoder.
+	if( cl->netchan.remote_address.type == NA_LOOPBACK )
+		return 0;
+#endif
 	bestBitCount = j = Delta_TestBaseline( *baseline, to, player, sv.time );
 	bestfound = index;
 
@@ -653,6 +660,21 @@ void SV_WriteEntitiesToClient( sv_client_t *cl, sizebuf_t *msg )
 	// add all the entities directly visible to the eye, which
 	// may include portal entities that merge other viewpoints
 	SV_AddEntitiesToPacket( cl->pViewEntity, cl->edict, frame, &frame_ents, true );
+
+#if !XASH_DEDICATED
+	// splitscreen: the local client also draws player 2's view, so merge its PVS
+	{
+		edict_t *p2 = CL_SplitViewEdict();
+
+		if( p2 && p2 != cl->edict && !FBitSet( cl->flags, FCL_FAKECLIENT ))
+		{
+			SetBits( sv.hostflags, SVF_MERGE_VISIBILITY );
+			SV_AddEntitiesToPacket( p2, cl->edict, frame, &frame_ents, false );
+			ClearBits( sv.hostflags, SVF_MERGE_VISIBILITY );
+		}
+	}
+#endif
+
 
 	if( c_notsend != cl->ignored_ents )
 	{

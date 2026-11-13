@@ -28,6 +28,67 @@ typedef struct
 	msurface_t	*surface;
 } linetrace_t;
 
+#if XASH_PS2
+int Mod_GetFaceContents( const char *name );			// mod_bmodel.c
+mvertex_t *Mod_GetVertexByNumber( model_t *mod, int surfedge );	// mod_bmodel.c
+
+/*
+==============
+PM_PointInFacet
+
+The PC engine keeps these edge planes for each face (640 KB on de_dust2) and
+only this file reads them. Same test, computed from the vertices when a trace
+gets here, which is a few faces per trace.
+==============
+*/
+static qboolean PM_PointInFacet( model_t *mod, const msurface_t *surf, const vec3_t point )
+{
+	vec3_t	origin, delta, edgevec, normal, faceNormal;
+	vec_t	radius = 0.0f, dist;
+	mvertex_t	*v;
+	int	i;
+
+	VectorClear( origin );
+	for( i = 0; i < surf->numedges; i++ )
+	{
+		v = Mod_GetVertexByNumber( mod, surf->firstedge + i );
+		VectorAdd( origin, v->position, origin );
+	}
+	VectorScale( origin, 1.0f / surf->numedges, origin );
+
+	for( i = 0; i < surf->numedges; i++ )
+	{
+		v = Mod_GetVertexByNumber( mod, surf->firstedge + i );
+		VectorSubtract( v->position, origin, delta );
+		dist = DotProduct( delta, delta );
+		radius = Q_max( dist, radius );
+	}
+
+	VectorSubtract( point, origin, delta );
+	if( DotProduct( delta, delta ) >= radius )
+		return false;
+
+	if( FBitSet( surf->flags, SURF_PLANEBACK ))
+		VectorNegate( surf->plane->normal, faceNormal );
+	else VectorCopy( surf->plane->normal, faceNormal );
+
+	for( i = 0; i < surf->numedges; i++ )
+	{
+		mvertex_t	*v0 = Mod_GetVertexByNumber( mod, surf->firstedge + i );
+		mvertex_t	*v1 = Mod_GetVertexByNumber( mod, surf->firstedge + (i + 1) % surf->numedges );
+
+		VectorSubtract( v1->position, v0->position, edgevec );
+		CrossProduct( faceNormal, edgevec, normal );
+		VectorNormalize( normal );
+
+		if( DotProduct( point, normal ) - DotProduct( normal, v0->position ) > FRAC_EPSILON )
+			return false; // outside the bounds
+	}
+
+	return true;
+}
+#endif // XASH_PS2
+
 /*
 ==============
 fix_coord
@@ -50,8 +111,10 @@ fence texture testing
 */
 int PM_SampleMiptex( const msurface_t *surf, const vec3_t point )
 {
+#if !XASH_PS2
 	mextrasurf_t	*info = surf->info;
 	mfacebevel_t	*fb = info->bevel;
+#endif
 	int		contents;
 	vec_t		ds, dt;
 	int		x, y;
@@ -59,8 +122,14 @@ int PM_SampleMiptex( const msurface_t *surf, const vec3_t point )
 	texture_t		*mt;
 
 	// fill the default contents
+#if XASH_PS2
+	if( surf->texinfo && surf->texinfo->texture )
+		contents = Mod_GetFaceContents( surf->texinfo->texture->name );
+	else contents = CONTENTS_SOLID;
+#else
 	if( fb ) contents = fb->contents;
 	else contents = CONTENTS_SOLID;
+#endif
 
 	if( !surf->texinfo || !surf->texinfo->texture ) 
 		return contents;
@@ -144,9 +213,14 @@ loc0:
 	for( i = 0; i < node->numsurfaces; i++ )
 	{
 		msurface_t	*surf = &mod->surfaces[node->firstsurface + i];
+		int		contents;
+#if XASH_PS2
+		if( !PM_PointInFacet( mod, surf, mid ))
+			continue;
+#else
 		mextrasurf_t	*info = surf->info;
 		mfacebevel_t	*fb = info->bevel;
-		int		j, contents;
+		int		j;
 		vec3_t		delta;
 
 		if( !fb ) continue;	// ???
@@ -163,6 +237,7 @@ loc0:
 
 		if( j != fb->numedges )
 			continue; // we are outside the bounds of the facet
+#endif
 
 		// hit the surface
 		contents = PM_SampleMiptex( surf, mid );

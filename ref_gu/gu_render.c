@@ -43,6 +43,9 @@ cvar_t	*r_adjust_fov;
 cvar_t	*r_decals;
 cvar_t	*r_novis;
 cvar_t	*r_nocull;
+#if XASH_PS2
+cvar_t	*r_split_pvs;
+#endif
 cvar_t	*r_lockpvs;
 cvar_t	*r_lockfrustum;
 cvar_t	*r_traceglow;
@@ -99,6 +102,10 @@ static SceUID	context_list_uid = -1;
 
 static void GU_AllocList( void )
 {
+#if XASH_PS2
+	guRender.context_list = NULL; // packets are in ref_gs/gs_gu.c
+	guRender.context_list_size = 0x7fffffff;
+#else
 	if( sceKernelMaxFreeMemSize() >= PSP_GU_LIST_SIZE + PSP_GU_LIST_OUTSIDE_LEFT )
 	{
 		context_list_uid = sceKernelAllocPartitionMemory( 2, "gu_list", PSP_SMEM_High, PSP_GU_LIST_SIZE, NULL );
@@ -118,13 +125,17 @@ static void GU_AllocList( void )
 		gEngfuncs.Host_Error( "Memory allocation failled! (guRender.context_list)\n" );
 	guRender.context_list_size = PSP_GU_LIST_SIZE_SMALL;
 	gEngfuncs.Con_Printf( "S_PSP: display list %i KB, in the heap\n", PSP_GU_LIST_SIZE_SMALL / 1024 );
+#endif
 }
 
 static void GU_FreeList( void )
 {
+#if !XASH_PS2
 	if( context_list_uid > 0 )
 		sceKernelFreePartitionMemory( context_list_uid );
-	else if( guRender.context_list )
+	else
+#endif
+	if( guRender.context_list )
 		free( guRender.context_list );
 
 	context_list_uid = -1;
@@ -146,6 +157,7 @@ static void GU_Init( void )
 	guRender.buffer_format = PSP_FB_FORMAT; 
 	guRender.buffer_bpp = PSP_FB_BPP;
 	
+#if !XASH_PS2
 	guRender.draw_buffer = ( void* )valloc( guRender.buffer_width * guRender.screen_height * guRender.buffer_bpp );
 	if( !guRender.draw_buffer )
 		gEngfuncs.Host_Error( "Memory allocation failled! (guRender.draw_buffer)\n" );
@@ -160,6 +172,7 @@ static void GU_Init( void )
 	guRender.depth_buffer = ( void* )valloc( guRender.buffer_width * guRender.screen_height * 2 );
 	if( !guRender.depth_buffer )
 		gEngfuncs.Host_Error( "Memory allocation failled! (guRender.depth_buffer)\n" );
+#endif
 
 	GU_AllocList();
 
@@ -366,7 +379,11 @@ void R_RenderInfo_f( void )
 void GL_InitExtensions( void )
 {
 	glState.stencilEnabled = true;
+#if XASH_PS2
+	glConfig.max_texture_size = 128; // keeps world textures in a few MB of EE RAM
+#else
 	glConfig.max_texture_size = 256;
+#endif
 	
 	// get our various GL strings
 	gEngfuncs.Con_Reportf( "^3Video^7: PSP HW\n" );
@@ -404,6 +421,9 @@ void GL_InitCommands( void )
 	r_lighting_ambient = gEngfuncs.Cvar_Get( "r_lighting_ambient", "0.3", FCVAR_ARCHIVE, "map ambient lighting scale" );
 	r_novis = gEngfuncs.Cvar_Get( "r_novis", "0", 0, "ignore vis information (perfomance test)" );
 	r_nocull = gEngfuncs.Cvar_Get( "r_nocull", "0", 0, "ignore frustrum culling (perfomance test)" );
+#if XASH_PS2
+	r_split_pvs = gEngfuncs.Cvar_Get( "r_split_pvs", "2", 0, "splitscreen PVS culling (0 off, 1 players, 2 players and static decor)" );
+#endif
 	r_detailtextures = gEngfuncs.Cvar_Get( "r_detailtextures", "0", FCVAR_ARCHIVE, "enable detail textures support, use '2' for autogenerate detail.txt" );  // disabled
 	r_lockpvs = gEngfuncs.Cvar_Get( "r_lockpvs", "0", FCVAR_CHEAT, "lockpvs area at current point (pvs test)" );
 	r_lockfrustum = gEngfuncs.Cvar_Get( "r_lockfrustum", "0", FCVAR_CHEAT, "lock frustrum area at current point (cull test)" );

@@ -25,7 +25,7 @@ GNU General Public License for more details.
 */
 void Matrix4x4_Concat( matrix4x4 out, const matrix4x4 in1, const matrix4x4 in2 )
 {
-#if 1
+#if !XASH_PS2
 	__asm__ (
 		".set		push\n"				// save assembler option
 		".set		noreorder\n"			// suppress reordering
@@ -125,6 +125,17 @@ void Matrix4x4_CreateModelview( matrix4x4 out )
 void Matrix4x4_ToFMatrix4( const matrix4x4 in, ScePspFMatrix4 *out )
 {
 	// transpose matrix
+#if XASH_PS2
+	{
+		const float *i = &in[0][0];
+		float *o = (float *)out;
+		int r, c;
+
+		for( r = 0; r < 4; r++ )
+			for( c = 0; c < 4; c++ )
+				o[c * 4 + r] = i[r * 4 + c];
+	}
+#else
 	__asm__ (
 		".set		push\n"				// save assembler option
 		".set		noreorder\n"			// suppress reordering
@@ -140,11 +151,23 @@ void Matrix4x4_ToFMatrix4( const matrix4x4 in, ScePspFMatrix4 *out )
 		: "=m"( *out )
 		: "m"( *in )
 	);
+#endif
 }
 
 void Matrix4x4_FromFMatrix4( matrix4x4 out, ScePspFMatrix4 *in )
 {
 	// transpose matrix
+#if XASH_PS2
+	{
+		const float *i = (const float *)in;
+		float *o = &out[0][0];
+		int r, c;
+
+		for( r = 0; r < 4; r++ )
+			for( c = 0; c < 4; c++ )
+				o[c * 4 + r] = i[r * 4 + c];
+	}
+#else
 	__asm__ (
 		".set		push\n"				// save assembler option
 		".set		noreorder\n"			// suppress reordering
@@ -160,6 +183,7 @@ void Matrix4x4_FromFMatrix4( matrix4x4 out, ScePspFMatrix4 *in )
 		: "=m"( *out )
 		: "m"( *in )
 	);
+#endif
 }
 
 void Matrix4x4_CreateTranslate( matrix4x4 out, float x, float y, float z )

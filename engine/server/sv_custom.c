@@ -121,9 +121,13 @@ void SV_ParseConsistencyResponse( sv_client_t *cl, sizebuf_t *msg )
 		{
 			value = MSG_ReadUBitLong( msg, 32 );
 
-			// will be compare only first 4 bytes
-			if( value != *(int *)r->rgucMD5_hash )
+			// Compare the 4 on-wire digest bytes, not signed int values.
+			// On PS2 EE/MIPS64, a hash whose high bit is set can compare
+			// unequal via differently-extended 32-bit register values.
+			if( memcmp( &value, r->rgucMD5_hash, sizeof( value )) != 0 )
+			{
 				badresindex = idx + 1;
+			}
 		}
 		else
 		{

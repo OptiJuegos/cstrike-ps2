@@ -30,7 +30,17 @@ typedef struct
 static int		nColinElim; // stats
 static vec2_t		world_orthocenter;
 static vec2_t		world_orthohalf;
-static uint		r_blocklights[BLOCK_SIZE_MAX*BLOCK_SIZE_MAX*3];
+#if XASH_PS2
+#define BLOCKLIGHT_CHANNELS	1 // the GS pass only uses a light value, see ensure_clut
+#else
+#define BLOCKLIGHT_CHANNELS	3
+#endif
+static uint		r_blocklights[BLOCK_SIZE_MAX*BLOCK_SIZE_MAX*BLOCKLIGHT_CHANNELS];
+
+#if XASH_PS2
+// Both passes draw the same xyz: the lightmap s,t pairs follow the vertices, 12 bytes less for each one
+#define POLY_LIGHT_UV( p )	((float (*)[2])&( p )->verts[( p )->numverts])
+#endif
 static mextrasurf_t		*fullbright_surfaces[MAX_TEXTURES];
 static mextrasurf_t		*detail_surfaces[MAX_TEXTURES];
 static int		rtable[MOD_FRAMES][MOD_FRAMES];
@@ -191,9 +201,14 @@ static void SubdividePolygon_r( msurface_t *warpface, int numverts, float *verts
 			t += sample_size * 0.5f;
 			t /= BLOCK_SIZE * sample_size; //fa->texinfo->texture->height;
 
+#if XASH_PS2
+			POLY_LIGHT_UV( poly )[i][0] = s;
+			POLY_LIGHT_UV( poly )[i][1] = t;
+#else
 			poly->verts[i + numverts].uv[0] = s;
 			poly->verts[i + numverts].uv[1] = t;
 			VectorCopy( verts, poly->verts[i + numverts].xyz );
+#endif
 		}
 	}
 }
@@ -290,7 +305,11 @@ static size_t GL_PolygonSize( int numverts )
 {
 	// 8 byte multiple: the GE reads the vertices straight from here, keep
 	// the alignment a block of its own had
+#if XASH_PS2
+	return ( sizeof( glpoly_t ) + ( numverts - 1 ) * sizeof( gu_vert_t ) + numverts * sizeof( float[2] ) + 7 ) & ~7;
+#else
 	return ( sizeof( glpoly_t ) + ( numverts * 2 - 1 ) * sizeof( gu_vert_t ) + 7 ) & ~7;
+#endif
 }
 
 /*
@@ -394,10 +413,36 @@ void GL_BuildPolygonFromSurface( model_t *mod, msurface_t *fa )
 		t += sample_size * 0.5f;
 		t /= BLOCK_SIZE * sample_size; //fa->texinfo->texture->height;
 
+#if XASH_PS2
+		POLY_LIGHT_UV( poly )[i][0] = s;
+		POLY_LIGHT_UV( poly )[i][1] = t;
+#else
 		poly->verts[i + poly->numverts].uv[0] = s;
 		poly->verts[i + poly->numverts].uv[1] = t;
 		VectorCopy( vec, poly->verts[i + poly->numverts].xyz );
+#endif
 	}
+
+#if XASH_PS2
+	// The GS loses texel precision on large S/T and smears the texture in
+	// streaks; shift the repeating texture by whole tiles to start near 0.
+	{
+		float	smin = poly->verts[0].uv[0], tmin = poly->verts[0].uv[1];
+
+		for( i = 1; i < lnumverts; i++ )
+		{
+			smin = Q_min( smin, poly->verts[i].uv[0] );
+			tmin = Q_min( tmin, poly->verts[i].uv[1] );
+		}
+		smin = floorf( smin );
+		tmin = floorf( tmin );
+		for( i = 0; i < lnumverts; i++ )
+		{
+			poly->verts[i].uv[0] -= smin;
+			poly->verts[i].uv[1] -= tmin;
+		}
+	}
+#endif
 
 	// remove co-linear points - Ed
 	if( !CVAR_TO_BOOL( gl_keeptjunctions ) && !FBitSet( fa->flags, SURF_UNDERWATER ))
@@ -424,7 +469,12 @@ void GL_BuildPolygonFromSurface( model_t *mod, msurface_t *fa )
 				for( j = i + 1; j < lnumverts; j++ )
 				{
 					poly->verts[j - 1] = poly->verts[j];
+#if XASH_PS2
+					POLY_LIGHT_UV( poly )[j - 1][0] = POLY_LIGHT_UV( poly )[j][0];
+					POLY_LIGHT_UV( poly )[j - 1][1] = POLY_LIGHT_UV( poly )[j][1];
+#else
 					poly->verts[poly->numverts + j - 1] = poly->verts[poly->numverts + j];
+#endif
 				}
 
 				// retry next vertex next time, which is now current vertex
@@ -437,8 +487,13 @@ void GL_BuildPolygonFromSurface( model_t *mod, msurface_t *fa )
 
 		if (num_removed > 0)
 		{
+#if XASH_PS2
+			// the light coordinates start right after the vertices that remain
+			memmove( &poly->verts[lnumverts], POLY_LIGHT_UV( poly ), lnumverts * sizeof( float[2] ));
+#else
 			for (i = poly->numverts; i < poly->numverts + lnumverts; i++)
 				poly->verts[i - num_removed] = poly->verts[i];
+#endif
 		}
 	}
 
@@ -621,7 +676,7 @@ void R_AddDynamicLights( msurface_t *surf )
 			td = (tl - tacc) * sample_frac;
 			if( td < 0 ) td = -td;
 
-			for( s = 0, sacc = 0; s < smax; s++, sacc += sample_size, bl += 3 )
+			for( s = 0, sacc = 0; s < smax; s++, sacc += sample_size, bl += BLOCKLIGHT_CHANNELS )
 			{
 				sd = (sl - sacc) * sample_frac;
 				if( sd < 0 ) sd = -sd;
@@ -631,9 +686,16 @@ void R_AddDynamicLights( msurface_t *surf )
 
 				if( dist < minlight )
 				{
+#if XASH_PS2
+					// same weights as the palette to light conversion in ensure_clut
+					bl[0] += ((int)((rad - dist) * 256) * (( gEngfuncs.LightToTexGamma( dl->color.r ) * 77
+						+ gEngfuncs.LightToTexGamma( dl->color.g ) * 150
+						+ gEngfuncs.LightToTexGamma( dl->color.b ) * 29 ) >> 8 )) / 256;
+#else
 					bl[0] += ((int)((rad - dist) * 256) * gEngfuncs.LightToTexGamma( dl->color.r )) / 256;
 					bl[1] += ((int)((rad - dist) * 256) * gEngfuncs.LightToTexGamma( dl->color.g )) / 256;
 					bl[2] += ((int)((rad - dist) * 256) * gEngfuncs.LightToTexGamma( dl->color.b )) / 256;
+#endif
 				}
 			}
 		}
@@ -759,7 +821,7 @@ static void R_BuildLightMap( msurface_t *surf, byte *dest, int stride, qboolean 
 	int		i, map, size, s, t;
 	int		sample_size;
 	mextrasurf_t	*info = surf->info;
-	color24		*lm;
+	lightsample_t	*lm;
 	byte		color[3];
 
 	sample_size = gEngfuncs.Mod_SampleSizeForFace( surf );
@@ -769,18 +831,22 @@ static void R_BuildLightMap( msurface_t *surf, byte *dest, int stride, qboolean 
 
 	lm = surf->samples;
 
-	memset( r_blocklights, 0, sizeof( uint ) * size * 3 );
+	memset( r_blocklights, 0, sizeof( uint ) * size * BLOCKLIGHT_CHANNELS );
 
 	// add all the lightmaps
 	for( map = 0; map < MAXLIGHTMAPS && surf->styles[map] != 255 && lm; map++ )
 	{
 		scale = tr.lightstylevalue[surf->styles[map]];
 
-		for( i = 0, bl = r_blocklights; i < size; i++, bl += 3, lm++ )
+		for( i = 0, bl = r_blocklights; i < size; i++, bl += BLOCKLIGHT_CHANNELS, lm++ )
 		{
+#if XASH_PS2
+			bl[0] += gEngfuncs.LightToTexGamma( *lm ) * scale;
+#else
 			bl[0] += gEngfuncs.LightToTexGamma( lm->r ) * scale;
 			bl[1] += gEngfuncs.LightToTexGamma( lm->g ) * scale;
 			bl[2] += gEngfuncs.LightToTexGamma( lm->b ) * scale;
+#endif
 		}
 	}
 
@@ -814,9 +880,13 @@ static void R_BuildLightMap( msurface_t *surf, byte *dest, int stride, qboolean 
 	{
 		for( s = 0; s < smax; s++ )
 		{
+#if XASH_PS2
+			color[0] = color[1] = color[2] = Q_min((bl[0] >> 7), 255 );
+#else
 			color[0] = Q_min((bl[0] >> 7), 255 );
 			color[1] = Q_min((bl[1] >> 7), 255 );
 			color[2] = Q_min((bl[2] >> 7), 255 );
+#endif
 			color[3] = 255;
 #if LIGHTMAP_BPP == 1
 			dest[0]  = ( color[0] >> 5 ) & 0x07;
@@ -837,7 +907,7 @@ static void R_BuildLightMap( msurface_t *surf, byte *dest, int stride, qboolean 
 			dest[2] = color[2];
 			dest[3] = 255;
 #endif
-			bl += 3;
+			bl += BLOCKLIGHT_CHANNELS;
 			dest += LIGHTMAP_BPP;
 		}
 	}
@@ -956,17 +1026,31 @@ void DrawGLPolyChain( glpoly_t *p, float soffset, float toffset )
 	{
 		float	*v;
 		int	i;
+#if XASH_PS2
+		// sceGuDrawArray and GU_Clip copy the vertices, so a stack array is enough
+		gu_vert_t	light_verts[p->numverts];
+		gu_vert_t	*verts = light_verts;
 
-		if ( GU_ClipIsRequired( &p->verts[p->numverts], p->numverts ) )
+		for( i = 0; i < p->numverts; i++ )
+		{
+			light_verts[i].uv[0] = POLY_LIGHT_UV( p )[i][0];
+			light_verts[i].uv[1] = POLY_LIGHT_UV( p )[i][1];
+			VectorCopy( p->verts[i].xyz, light_verts[i].xyz );
+		}
+#else
+		gu_vert_t	*verts = &p->verts[p->numverts];
+#endif
+
+		if ( GU_ClipIsRequired( verts, p->numverts ) )
 		{
 			// clip the polygon.
 			gu_vert_t*	cv;
 			int		cvc;
 
-			GU_Clip( &p->verts[p->numverts], p->numverts, &cv, &cvc );
+			GU_Clip( verts, p->numverts, &cv, &cvc );
 			if( cvc ) sceGuDrawArray( GU_TRIANGLE_FAN, GU_TEXTURE_32BITF | GU_VERTEX_32BITF, cvc, 0, cv );
 		}
-		else sceGuDrawArray( GU_TRIANGLE_FAN, GU_TEXTURE_32BITF | GU_VERTEX_32BITF, p->numverts, 0, &p->verts[p->numverts] );
+		else sceGuDrawArray( GU_TRIANGLE_FAN, GU_TEXTURE_32BITF | GU_VERTEX_32BITF, p->numverts, 0, verts );
 	}
 
 	if( dynamic ) sceGuTexOffset( 0.0f, 0.0f );
@@ -1217,6 +1301,39 @@ void R_RenderDetails( void )
 	GL_ResetFogColor();
 }
 
+#if XASH_PS2
+/*
+================
+R_DrawLitPolyPS2
+
+Texture and static lightmap from one copy of the vertices, see ps2_gu_world_fan.
+Surfaces with changing light keep the lightmap pass in R_BlendLightmaps.
+================
+*/
+static qboolean R_DrawLitPolyPS2( msurface_t *fa )
+{
+	glpoly_t		*p = fa->polys;
+	gl_texture_t	*lm;
+	int		maps;
+
+	if( !p || p->next || FBitSet( p->flags, SURF_DRAWTILED|SURF_CONVEYOR ))
+		return false;
+	if( RI.currententity->curstate.rendermode != kRenderNormal || CVAR_TO_BOOL( r_lightmap ) || !R_HasLightmap( ))
+		return false;
+	if( fa->dlightframe == tr.framecount )
+		return false;
+	for( maps = 0; maps < MAXLIGHTMAPS && fa->styles[maps] != 255; maps++ )
+	{
+		if( tr.lightstylevalue[fa->styles[maps]] != fa->cached_light[maps] )
+			return false;
+	}
+
+	lm = R_GetTexture( tr.lightmapTextures[fa->lightmaptexturenum] );
+	return ps2_gu_world_fan( &p->verts[0].uv[0], POLY_LIGHT_UV( p ), p->numverts, lm->dstTexture, lm->dstPalette,
+		lm->width, lm->height, CVAR_TO_BOOL( gl_lightmap_nearest ));
+}
+#endif
+
 /*
 ================
 R_RenderBrushPoly
@@ -1225,6 +1342,7 @@ R_RenderBrushPoly
 void R_RenderBrushPoly( msurface_t *fa, int cull_type )
 {
 	qboolean	is_dynamic = false;
+	qboolean	lit = false;
 	int	maps;
 	texture_t	*t;
 
@@ -1280,7 +1398,11 @@ void R_RenderBrushPoly( msurface_t *fa, int cull_type )
 		}
 	}
 
-	DrawGLPoly( fa->polys, 0.0f, 0.0f );
+#if XASH_PS2
+	lit = R_DrawLitPolyPS2( fa );
+#endif
+	if( !lit )
+		DrawGLPoly( fa->polys, 0.0f, 0.0f );
 
 	if( RI.currententity->curstate.rendermode == kRenderNormal )
 	{
@@ -1294,8 +1416,8 @@ void R_RenderBrushPoly( msurface_t *fa, int cull_type )
 		DrawSurfaceDecals( fa, true, (cull_type == CULL_BACKSIDE));
 	}
 
-	if( FBitSet( fa->flags, SURF_DRAWTILED ))
-		return; // no lightmaps anyway
+	if( FBitSet( fa->flags, SURF_DRAWTILED ) || lit )
+		return; // no lightmaps anyway, or already drawn
 
 	// check for lightmap modification
 	for( maps = 0; maps < MAXLIGHTMAPS && fa->styles[maps] != 255; maps++ )

@@ -8,7 +8,21 @@
  * Copyright (c) 2007 Alexander Berl 'Raphael' <raphael@fx-world.org>
  * http://wordpress.fx-world.org
  */
+#include "build.h"
 #include "gu_vram.h"
+#if XASH_PS2
+#include <malloc.h>
+#include <stdlib.h>
+// GS memory is a cache managed by ref_gs/gs_gu.c: every texture lives in EE RAM
+int vinit( void ) { return 0; }
+void *vrelptr( void *ptr ) { return ptr; }
+void *vabsptr( void *ptr ) { return ptr; }
+void *valloc( size_t size ) { return memalign( 64, size ); }
+void vfree( void *ptr ) { free( ptr ); }
+size_t vmemavail( void ) { return 0; }
+size_t vlargestblock( void ) { return 0; }
+int vchkptr( void *ptr ) { (void)ptr; return 0; }
+#else
 #include <stdio.h>
 #include <pspge.h>
 #include <stdlib.h>
@@ -297,3 +311,4 @@ int vchkptr( void *ptr )
 {
 	return ((( unsigned int )ptr >= __mem_start ) && (( unsigned int )ptr < __mem_start + __mem_size ));
 }
+#endif // XASH_PS2

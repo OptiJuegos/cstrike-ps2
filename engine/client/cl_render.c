@@ -339,11 +339,18 @@ qboolean R_InitRenderAPI( void )
 
 	// fill missing functions from renderer
 	R_FillRenderAPIFromRef( &gRenderAPI, &ref.dllFuncs );
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=RENDER_API_EXPORT ptr=%p ref_texture=%p\n",
+		(void *)clgame.dllFuncs.pfnGetRenderInterface, (void *)gRenderAPI.GL_LoadTexture );
+	#endif
 
 	if( clgame.dllFuncs.pfnGetRenderInterface )
 	{
 		if( clgame.dllFuncs.pfnGetRenderInterface( CL_RENDER_INTERFACE_VERSION, &gRenderAPI, &clgame.drawFuncs ))
 		{
+			#if XASH_PS2
+			printf( "[XASH-PS2] STAGE=RENDER_API_CLIENT_BOUND\n" );
+			#endif
 			Con_Reportf( "CL_LoadProgs: ^2initailized extended RenderAPI ^7ver. %i\n", CL_RENDER_INTERFACE_VERSION );
 			return true;
 		}

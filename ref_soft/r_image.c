@@ -15,11 +15,61 @@ GNU General Public License for more details.
 
 #include "r_local.h"
 
+#if XASH_PS2
+/* Original filesystem and renderer are statically linked on PS2. */
+extern file_t *FS_Open( const char *filepath, const char *mode, qboolean gamedironly );
+extern fs_offset_t FS_Read( file_t *file, void *buffer, size_t buffersize );
+extern fs_offset_t FS_FileLength( file_t *file );
+extern int FS_Close( file_t *file );
+#endif
+
 #define TEXTURES_HASH_SIZE	(MAX_TEXTURES >> 2)
 
 static image_t		r_images[MAX_TEXTURES];
 static image_t*	r_imagesHashTable[TEXTURES_HASH_SIZE];
 static uint		r_numImages;
+
+#if XASH_PS2
+/* Original 640hud*.spr images are 256x256 8-bit indexed. The full-size
+ * 16-bit color and alpha copies cost 256 KiB per atlas even though the HUD
+ * uses one sprite at a time. Preserve every original pixel index and palette
+ * in the texture's own allocation, materializing into one shared pair of
+ * scratch images only for the synchronous software drawing operation. */
+typedef struct ps2_hudindexed_s
+{
+	byte indices[256 * 256];
+	pixel_t color[256];
+	pixel_t alpha[256];
+} ps2_hudindexed_t;
+
+static pixel_t ps2_hudPixels[256 * 256];
+static pixel_t ps2_hudAlphaPixels[256 * 256];
+static image_t *ps2_hudMaterialized;
+
+void R_PS2PrepareIndexedHud( image_t *tex )
+{
+	ps2_hudindexed_t *hud;
+	uint i;
+
+	if( !tex || !tex->ps2HudIndexed || tex == ps2_hudMaterialized ) return;
+	hud = (ps2_hudindexed_t *)tex->ps2HudIndexed;
+	if( ps2_hudMaterialized )
+	{
+		ps2_hudMaterialized->pixels[0] = NULL;
+		ps2_hudMaterialized->alpha_pixels = NULL;
+	}
+	for( i = 0; i < 256 * 256; i++ )
+	{
+		byte index = hud->indices[i];
+		ps2_hudPixels[i] = hud->color[index];
+		if( FBitSet( tex->flags, TF_HAS_ALPHA ))
+			ps2_hudAlphaPixels[i] = hud->alpha[index];
+	}
+	tex->pixels[0] = ps2_hudPixels;
+	tex->alpha_pixels = FBitSet( tex->flags, TF_HAS_ALPHA ) ? ps2_hudAlphaPixels : NULL;
+	ps2_hudMaterialized = tex;
+}
+#endif
 
 #define IsLightMap( tex )	( FBitSet(( tex )->flags, TF_ATLAS_PAGE ))
 /*
@@ -53,6 +103,9 @@ void GAME_EXPORT GL_Bind( int tmu, unsigned int texnum )
 	extern void R_PolysetDrawSpansGlow( void *pspanpackage);
 
 	image = &r_images[texnum];
+	#if XASH_PS2
+	R_PS2PrepareIndexedHud( image );
+	#endif
 	//vid.rendermode = kRenderNormal;
 
 	if( vid.rendermode == kRenderNormal )
@@ -210,6 +263,38 @@ static void GL_SetTextureDimensions( image_t *tex, int width, int height, int de
 
 	Assert( tex != NULL );
 
+	#if XASH_PS2
+	// ReGameDLL precaches every weapon's Studio skin at map startup. With a
+	// 32 MiB EE budget, a maximum of 64 px per Studio skin is the low-memory
+	// startup preset. All geometry, original MDLs, WADs and menu art remain
+	// unchanged; only the renderer's in-memory skin cache is downsampled.
+	if( !Q_strnicmp( tex->name, "#models/", 8 ))
+	{
+		// Only the view weapon and people are seen up close; dropped weapons,
+		// weapons in other hands, gibs and props are a few pixels on screen.
+		if( !Q_strnicmp( tex->name, "#models/v_", 10 ) ||
+			!Q_strnicmp( tex->name, "#models/player", 14 ) ||
+			!Q_strnicmp( tex->name, "#models/hostage", 15 ))
+			maxTextureSize = 64;
+		else maxTextureSize = 32;
+	}
+	// Particle/effect sprites are numerous (hundreds of separate frames).
+	// The long wall-impact/smoke animations have a smaller in-memory cache
+	// while preserving every original frame and its transparency layer.
+	else if( !Q_strnicmp( tex->name, "#sprites/wall_puff", 18 ) ||
+		!Q_strnicmp( tex->name, "#sprites/black_smoke", 20 )) maxTextureSize = 16;
+	else if( !Q_strnicmp( tex->name, "#sprites/", 9 )) maxTextureSize = 24;
+	// BSP/WAD textures retain their original source assets and mip-chain;
+	// 64px software copies are the PS2 low-memory preset. At 480x272 this
+	// frees EE RAM for full-resolution 256x256 HUD sprites without dropping
+	// map faces, lightmaps, materials, or models.
+	else if( tex->type == it_wall ) maxTextureSize = 64;
+	// The 800x600 menu backdrop stays in memory during the game; at 480 px wide
+	// each 256 px tile covers about 154 screen pixels.
+	else if( !Q_strnicmp( tex->name, "resource/background/", 20 )) maxTextureSize = 128;
+#endif
+
+
 	// store original sizes
 	tex->srcWidth = width;
 	tex->srcHeight = height;
@@ -260,6 +345,120 @@ static void GL_SetTextureFormat( image_t *tex, pixformat_t format, int channelMa
 	Assert( tex != NULL );
 	//tex->transparent = !!( channelMask & IMAGE_HAS_ALPHA );
 }
+
+#if XASH_PS2
+/* ReGameDLL precaches all Studio skins, even for weapons not currently held.
+ * ImageLib's regular route inflates each indexed skin to a 256 KiB RGBA
+ * buffer; ref_soft immediately converts that into its 16-bit pixel format.
+ * Convert the indexed image directly instead, keeping the original palette
+ * and a single mip level. Embedded indexed sprite images also benefit, but
+ * are never resolution limited. Ordinary WAD/world/menu textures still use
+ * their existing processing and mipmaps. */
+static qboolean GL_UploadPS2StudioIndexed( image_t *tex, const rgbdata_t *pic )
+{
+	const byte *indices = pic->buffer;
+	const byte *palette = pic->palette;
+	uint x, y, w = tex->width, h = tex->height;
+	const uint srcw = pic->width, srch = pic->height;
+	static uint converted = 0;
+
+	if( !indices || !palette || !srcw || !srch || !w || !h ) return false;
+	if( !Q_strnicmp( tex->name, "#HUD/sprites/640hud", 19 ) &&
+		srcw == 256 && srch == 256 && w == 256 && h == 256 )
+	{
+		ps2_hudindexed_t *hud = (ps2_hudindexed_t *)Mem_Calloc( r_temppool, sizeof( *hud ));
+		uint i;
+		memcpy( hud->indices, indices, sizeof( hud->indices ));
+		for( i = 0; i < 256; i++ )
+		{
+			const byte *rgba = palette + i * 4;
+			uint r = rgba[0] * BIT(5) / 256;
+			uint g = rgba[1] * BIT(6) / 256;
+			uint b = rgba[2] * BIT(5) / 256;
+			uint major = (((r >> 2) & MASK(3)) << 5) |
+				(((g >> 3) & MASK(3)) << 2) | ((b >> 3) & MASK(2));
+			uint minor = MOVE_BIT(r,1,5) | MOVE_BIT(r,0,2) |
+				MOVE_BIT(g,2,7) | MOVE_BIT(g,1,4) | MOVE_BIT(g,0,1) |
+				MOVE_BIT(b,2,6) | MOVE_BIT(b,1,3) | MOVE_BIT(b,0,0);
+			uint alpha = (rgba[3] * 8 / 256) << (16 - 3);
+			pixel_t color = (major << 8) | (minor & 0xff);
+			hud->alpha[i] = (color >> 3) | alpha;
+			if( FBitSet( tex->flags, TF_HAS_ALPHA ) && !sw_noalphabrushes->value &&
+				rgba[3] < 128 && FBitSet( pic->flags, IMAGE_ONEBIT_ALPHA ))
+				color = TRANSPARENT_COLOR;
+			hud->color[i] = color;
+		}
+		tex->ps2HudIndexed = hud;
+		tex->numMips = 1;
+		tex->size += sizeof( *hud );
+		converted++;
+		printf( "[XASH-PS2] STAGE=HUD_INDEXED_COMPACT name=%s bytes=%u\n",
+			tex->name, (unsigned)sizeof( *hud ));
+		return true;
+	}
+	tex->pixels[0] = (pixel_t *)Mem_Calloc( r_temppool, w * h * sizeof(pixel_t) );
+	if( FBitSet( tex->flags, TF_HAS_ALPHA ))
+		tex->alpha_pixels = (pixel_t *)Mem_Calloc( r_temppool, w * h * sizeof(pixel_t) );
+
+	for( y = 0; y < h; y++ )
+	{
+		for( x = 0; x < w; x++ )
+		{
+			uint r = 0, g = 0, b = 0, a = 0, j, count;
+			uint major, minor, index = y * w + x;
+			/* Match GL_ResampleTexture's 2x2 box filter for scaled skins;
+			 * when not scaled, preserve every original palette index. */
+			count = (srcw == w && srch == h) ? 1 : 4;
+			for( j = 0; j < count; j++ )
+			{
+				uint sx, sy, palIndex;
+				const byte *rgba;
+				if( count == 1 )
+				{
+					sx = x;
+					sy = y;
+				}
+				else
+				{
+					/* The original filter samples at 1/4 and 3/4 texel
+					 * offsets horizontally and vertically. */
+					sx = (uint)(((uint64_t)(4 * x + (j & 1 ? 3 : 1)) * srcw) / (4 * w));
+					sy = (uint)(((uint64_t)(4 * y + (j & 2 ? 3 : 1)) * srch) / (4 * h));
+					if( sx >= srcw ) sx = srcw - 1;
+					if( sy >= srch ) sy = srch - 1;
+				}
+				palIndex = indices[sy * srcw + sx];
+				rgba = palette + palIndex * 4;
+				r += rgba[0]; g += rgba[1]; b += rgba[2]; a += rgba[3];
+			}
+			r = (r / count) * BIT(5) / 256;
+			g = (g / count) * BIT(6) / 256;
+			b = (b / count) * BIT(5) / 256;
+			major = (((r >> 2) & MASK(3)) << 5) |
+				(((g >> 3) & MASK(3)) << 2) | ((b >> 3) & MASK(2));
+			minor = MOVE_BIT(r,1,5) | MOVE_BIT(r,0,2) |
+				MOVE_BIT(g,2,7) | MOVE_BIT(g,1,4) | MOVE_BIT(g,0,1) |
+				MOVE_BIT(b,2,6) | MOVE_BIT(b,1,3) | MOVE_BIT(b,0,0);
+			tex->pixels[0][index] = (major << 8) | (minor & 0xFF);
+			if( tex->alpha_pixels )
+			{
+				uint alpha = ((a / count) * 8 / 256) << (16 - 3);
+				tex->alpha_pixels[index] = (tex->pixels[0][index] >> 3) | alpha;
+				if( !sw_noalphabrushes->value && (a / count) < 128 &&
+					FBitSet( pic->flags, IMAGE_ONEBIT_ALPHA ))
+					tex->pixels[0][index] = TRANSPARENT_COLOR;
+			}
+		}
+	}
+	tex->numMips = 1;
+	tex->size += GL_CalcTextureSize( w, h, tex->depth );
+	converted++;
+	if( converted == 1 || (converted % 25) == 0 )
+		printf( "[XASH-PS2] STAGE=STUDIO_INDEXED_DIRECT count=%u last=%s src=%ux%u dst=%ux%u\n",
+			converted, tex->name, srcw, srch, w, h );
+	return true;
+}
+#endif
 
 /*
 =================
@@ -547,10 +746,24 @@ static qboolean GL_UploadTexture( image_t *tex, rgbdata_t *pic )
 
 	if( !pic->buffer )
 		return true;
+	#if XASH_PS2
+	if( tex->name[0] == '#' && pic->type == PF_INDEXED_32 && pic->palette )
+		return GL_UploadPS2StudioIndexed( tex, pic );
+	#endif
 
 	buf = pic->buffer;
 
 	mipCount = 4;//GL_CalcMipmapCount( tex, ( buf != NULL ));
+	#if XASH_PS2
+	/* HUD and UI requests with TF_NOMIPMAP do not need four pixel copies. */
+	if( FBitSet( tex->flags, TF_NOMIPMAP )) mipCount = 1;
+	// ReGameDLL precaches every CS weapon skin. Studio mesh rasterization
+	// samples pixels[0] exclusively; unlike BSP surfaces it never uses the
+	// other three mip levels. Do not allocate these unused copies on PS2.
+	// Studio/sprite textures can use one level; world/WAD textures can
+	// also start with '#map:' and still need mips for software surfaces.
+	if( tex->name[0] == '#' && tex->type != it_wall ) mipCount = 1;
+	#endif
 
 	// NOTE: only single uncompressed textures can be resamples, no mips, no layers, no sides
 	if((( pic->width != tex->width ) || ( pic->height != tex->height )))
@@ -788,7 +1001,13 @@ static void GL_ProcessImage( image_t *tex, rgbdata_t *pic )
 
 		// we need to expand image into RGBA buffer
 		if( pic->type == PF_INDEXED_24 || pic->type == PF_INDEXED_32 )
+		{
+			#if XASH_PS2
+			if( !(tex->name[0] == '#' && pic->type == PF_INDEXED_32 && pic->palette &&
+				!FBitSet( tex->flags, TF_MAKELUMA|TF_ALLOW_EMBOSS )))
+			#endif
 			img_flags |= IMAGE_FORCE_RGBA;
+		}
 
 		// processing image before uploading (force to rgba, make luma etc)
 		if( pic->buffer ) gEngfuncs.Image_Process( &pic, 0, 0, img_flags, gl_emboss_scale->value );
@@ -868,6 +1087,14 @@ static image_t *GL_AllocTexture( const char *name, texFlags_t flags )
 
 	//tex->texnum = i; // texnum is used for fast acess into gl_textures array too
 	tex->flags = flags;
+#if XASH_PS2
+	// The BSP loader uniquely marks real world/WAD textures with
+	// TF_ALLOW_EMBOSS. Keep that classification after GL_ProcessImage
+	// consumes the flag, so PS2 can bound *only* cached world pixels.
+	// Sky, HUD, menus and model textures keep their existing policies.
+	if( FBitSet( flags, TF_ALLOW_EMBOSS ))
+		tex->type = it_wall;
+#endif
 
 	// add to hash table
 	tex->hashValue = COM_HashKey( name, TEXTURES_HASH_SIZE );
@@ -890,8 +1117,8 @@ static void GL_DeleteTexture( image_t *tex )
 
 	ASSERT( tex != NULL );
 
-	// already freed?
-	if( !tex->pixels[0]) return;
+	// Failed uploads can have a live hash entry without pixel storage.
+	if( !tex->name[0]) return;
 
 	// debug
 	if( !tex->name[0] )
@@ -919,6 +1146,16 @@ static void GL_DeleteTexture( image_t *tex )
 	// release source
 	if( tex->original )
 		gEngfuncs.FS_FreeImage( tex->original );
+	#if XASH_PS2
+	if( tex->ps2HudIndexed )
+	{
+		if( ps2_hudMaterialized == tex ) ps2_hudMaterialized = NULL;
+		Mem_Free( tex->ps2HudIndexed );
+		tex->ps2HudIndexed = NULL;
+		tex->pixels[0] = NULL; // common renderer scratch, not a heap allocation
+		tex->alpha_pixels = NULL;
+	}
+	#endif
 
 	for( i = 0; i < 4; i++ )
 		if( tex->pixels[i]) Mem_Free(tex->pixels[i]);
@@ -965,6 +1202,83 @@ void GAME_EXPORT GL_UpdateTexSize( int texnum, int width, int height, int depth 
 GL_LoadTexture
 ================
 */
+#if XASH_PS2
+/*
+ * Keep original uncompressed BGRA32 HUD overlays, but decode a row at a
+ * time. FS_LoadImage normally holds both a 256 KiB file and 256 KiB RGBA
+ * image while converting them to the software renderer's 16-bit format.
+ * After the world and Studio models load, those temporary copies can OOM.
+ * Limit this path to the verified original scope arc: unrelated image
+ * types and assets continue through the ordinary ImageLib path.
+ */
+static int GL_LoadPS2StreamedTGA( const char *name, texFlags_t flags )
+{
+	file_t *file;
+	image_t *tex;
+	byte header[18], row[256 * 4];
+	uint x, y;
+	qboolean topOrigin;
+
+	if( Q_stricmp( name, "sprites/scope_arc_nw.tga" ) ||
+		!FBitSet( flags, TF_NOMIPMAP ) || FBitSet( flags, TF_NOFLIP_TGA ))
+		return -1;
+
+	file = FS_Open( name, "rb", false );
+	if( !file ) return -1;
+	if( FS_Read( file, header, sizeof( header )) != sizeof( header ) ||
+		header[0] != 0 || header[1] != 0 || header[2] != 2 ||
+		header[12] != 0 || header[13] != 1 ||
+		header[14] != 0 || header[15] != 1 ||
+		header[16] != 32 || (header[17] & 0x0f) != 8 ||
+		(header[17] & 0x10) != 0 || FS_FileLength( file ) < 18 + 256 * 256 * 4 )
+	{
+		FS_Close( file );
+		return -1;
+	}
+
+	tex = GL_AllocTexture( name, flags | TF_HAS_ALPHA );
+	tex->type = it_pic;
+	GL_SetTextureDimensions( tex, 256, 256, 1 );
+	tex->numMips = 1;
+	tex->pixels[0] = (pixel_t *)Mem_Calloc( r_temppool, 256 * 256 * sizeof( pixel_t ));
+	tex->alpha_pixels = (pixel_t *)Mem_Calloc( r_temppool, 256 * 256 * sizeof( pixel_t ));
+	tex->size = 256 * 256 * sizeof( pixel_t );
+	topOrigin = (header[17] & 0x20) != 0;
+
+	for( y = 0; y < 256; y++ )
+	{
+		uint dstrow = topOrigin ? y : (255 - y);
+		if( FS_Read( file, row, sizeof( row )) != sizeof( row ))
+		{
+			FS_Close( file );
+			GL_DeleteTexture( tex );
+			return 0;
+		}
+		for( x = 0; x < 256; x++ )
+		{
+			const byte *bgra = &row[x * 4];
+			uint r = bgra[2] * BIT(5) / 256;
+			uint g = bgra[1] * BIT(6) / 256;
+			uint b = bgra[0] * BIT(5) / 256;
+			uint major = (((r >> 2) & MASK(3)) << 5) |
+				(((g >> 3) & MASK(3)) << 2) | ((b >> 3) & MASK(2));
+			uint minor = MOVE_BIT(r, 1, 5) | MOVE_BIT(r, 0, 2) |
+				MOVE_BIT(g, 2, 7) | MOVE_BIT(g, 1, 4) | MOVE_BIT(g, 0, 1) |
+				MOVE_BIT(b, 2, 6) | MOVE_BIT(b, 1, 3) | MOVE_BIT(b, 0, 0);
+			uint idx = dstrow * 256 + x;
+			uint alpha = (bgra[3] * 8 / 256) << (16 - 3);
+			tex->pixels[0][idx] = (major << 8) | (minor & 0xff);
+			tex->alpha_pixels[idx] = (tex->pixels[0][idx] >> 3) | alpha;
+		}
+	}
+	FS_Close( file );
+	SetBits( tex->flags, TF_IMG_UPLOADED );
+	GL_ApplyTextureParams( tex );
+	printf( "[XASH-PS2] STAGE=TGA_STREAMED_DIRECT name=%s size=256x256\n", name );
+	return (int)(tex - r_images);
+}
+#endif
+
 int GAME_EXPORT GL_LoadTexture( const char *name, const byte *buf, size_t size, int flags )
 {
 	image_t	*tex;
@@ -978,11 +1292,25 @@ int GAME_EXPORT GL_LoadTexture( const char *name, const byte *buf, size_t size, 
 	if(( tex = GL_TextureForName( name )))
 		return (tex - r_images);
 
+#if XASH_PS2
+	if( !buf && !size )
+	{
+		int streamed = GL_LoadPS2StreamedTGA( name, flags );
+		if( streamed >= 0 ) return streamed;
+	}
+#endif
+
 	if( FBitSet( flags, TF_NOFLIP_TGA ))
 		SetBits( picFlags, IL_DONTFLIP_TGA );
 
 	if( FBitSet( flags, TF_KEEP_SOURCE ) && !FBitSet( flags, TF_EXPAND_SOURCE ))
 		SetBits( picFlags, IL_KEEP_8BIT );	
+		#if XASH_PS2
+		// Preserve the index+palette representation of Studio skins while
+		// decoding. The direct upload converts them straight to 16-bit pixels.
+		if( name[0] == '#' && !FBitSet( flags, TF_MAKELUMA|TF_ALLOW_EMBOSS ))
+			SetBits( picFlags, IL_KEEP_8BIT );
+		#endif
 
 	// set some image flags
 	gEngfuncs.Image_SetForceFlags( picFlags );
@@ -996,7 +1324,7 @@ int GAME_EXPORT GL_LoadTexture( const char *name, const byte *buf, size_t size, 
 
 	if( !GL_UploadTexture( tex, pic ))
 	{
-		memset( tex, 0, sizeof( image_t ));
+		GL_DeleteTexture( tex ); // unlink hash and release partial allocations
 		gEngfuncs.FS_FreeImage( pic ); // release source texture
 		return 0;
 	}
@@ -1339,14 +1667,21 @@ void R_TextureList_f( void )
 
 	for( i = texCount = 0, image = r_images; i < r_numImages; i++, image++ )
 	{
-		if( !image->pixels ) continue;
+		int	size;
 
-		bytes += image->size;
+		if( !image->name[0] ) continue;
+
+		// the alpha layer is a separate allocation that tex->size does not count
+		size = image->size;
+		if( image->alpha_pixels )
+			size += image->width * image->height * sizeof( pixel_t );
+
+		bytes += size;
 		texCount++;
 
 		gEngfuncs.Con_Printf( "%4i: ", i );
 		gEngfuncs.Con_Printf( "%4i %4i ", image->width, image->height );
-		gEngfuncs.Con_Printf( "%12s ", Q_memprint( image->size ));
+		gEngfuncs.Con_Printf( "%12d ", size );
 
 		if( image->flags & TF_NORMALMAP )
 			gEngfuncs.Con_Printf( "normal  " );

@@ -28,7 +28,7 @@ void*		in_mousecursor;
 qboolean	in_mouseactive;				// false when not focus app
 qboolean	in_mouseinitialized;
 qboolean	in_mouse_suspended;
-POINT		in_lastvalidpos;
+struct { int x, y; } in_lastvalidpos; // int: Windows POINT is LONG
 qboolean	in_mouse_savedpos;
 static struct inputstate_s
 {
@@ -344,7 +344,7 @@ IN_MouseMove
 */
 void IN_MouseMove( void )
 {
-	POINT	current_pos;
+	struct { int x, y; } current_pos;
 	
 	if( !in_mouseinitialized || !in_mouseactive || !UI_IsVisible( ))
 		return;

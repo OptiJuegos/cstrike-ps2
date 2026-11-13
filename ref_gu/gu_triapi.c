@@ -394,8 +394,10 @@ void TriFog( float flFogColor[3], float flStart, float flEnd, int bOn )
 	RI.fogEnd = flEnd;
 
 #if 1
+#if !XASH_PS2 // the client sets the fog every frame
 	printf("TRI FOG:  s %f  e %f c %f %f %f %f \n", RI.fogStart, RI.fogEnd,
 			RI.fogColor[0], RI.fogColor[1], RI.fogColor[2], RI.fogColor[3] );
+#endif
 
 	//glState.fogDensity = RI.fogDensity
 	glState.fogColor = GUCOLOR4F( RI.fogColor[0], RI.fogColor[1], RI.fogColor[2], glState.fogDensity );

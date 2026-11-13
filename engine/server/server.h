@@ -32,7 +32,7 @@ GNU General Public License for more details.
 //=============================================================================
 
 #define SV_UPDATE_MASK	(SV_UPDATE_BACKUP - 1)
-#if XASH_LOW_MEMORY == 2
+#if XASH_LOW_MEMORY == 2 && XASH_PS2 // PS2 only hosts loopback games: no latency to cover
 #define SV_UPDATE_BACKUP SINGLEPLAYER_BACKUP
 #else
 extern int SV_UPDATE_BACKUP;
@@ -155,7 +155,8 @@ typedef struct server_s
 	lightstyle_t	lightstyles[MAX_LIGHTSTYLES];
 
 	consistency_t	consistency_list[MAX_MODELS];
-	resource_t	resources[MAX_RESOURCES];
+	resource_t	*resources;		// grows in SV_AddResource, freed with the level
+	int		max_resources;
 	int		num_consistency;	// typically check model bounds on this
 	int		num_resources;
 
@@ -479,6 +480,7 @@ void Master_Packet( void );
 // sv_init.c
 //
 void SV_ActivateServer( int runPhysics );
+void SV_FreeResources( void );
 qboolean SV_SpawnServer( const char *server, const char *startspot, qboolean background );
 #if XASH_EXT_OPT == 2
 #define SV_ModelHandle( modelindex ) (( modelindex < 0 || modelindex >= MAX_MODELS ) ? NULL : sv.models[( modelindex )])
@@ -548,6 +550,7 @@ void SV_ClientThink( sv_client_t *cl, usercmd_t *cmd );
 void SV_ExecuteClientMessage( sv_client_t *cl, sizebuf_t *msg );
 void SV_ConnectionlessPacket( netadr_t from, sizebuf_t *msg );
 edict_t *SV_FakeConnect( const char *netname );
+void GAME_EXPORT pfnRunPlayerMove( edict_t *pClient, const float *viewangles, float fmove, float smove, float upmove, word buttons, byte impulse, byte msec );
 void SV_ExecuteClientCommand( sv_client_t *cl, char *s );
 void SV_RunCmd( sv_client_t *cl, usercmd_t *ucmd, int random_seed );
 void SV_BuildReconnect( sizebuf_t *msg );

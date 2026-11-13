@@ -496,7 +496,7 @@ edict_t *SV_FakeConnect( const char *netname )
 	sv.current_client = cl;
 
 	if( cl->frames ) Mem_Free( cl->frames );	// fakeclients doesn't have frames
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	Netchan_FreeBuffers( &cl->netchan );	// nor a channel: a player used this slot before
 #endif
 	memset( cl, 0, sizeof( sv_client_t ));
@@ -1268,6 +1268,10 @@ void SV_PutClientInServer( sv_client_t *cl )
 	static byte    	msg_buf[MAX_INIT_MSG + 0x200];	// MAX_INIT_MSG + some space
 	edict_t		*ent = cl->edict;
 	sizebuf_t		msg;
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=SV_PUT_CLIENT_ENTER ent=%p callback=%p state=%d\n",
+		(void *)ent, (void *)svgame.dllFuncs.pfnClientPutInServer, cl->state );
+	#endif
 
 	MSG_Init( &msg, "Spawn", msg_buf, sizeof( msg_buf ));
 
@@ -1328,7 +1332,13 @@ void SV_PutClientInServer( sv_client_t *cl )
 
 		// fisrt entering
 		svgame.globals->time = sv.time;
+		#if XASH_PS2
+		printf( "[XASH-PS2] STAGE=SV_PUT_CLIENT_CALLBACK_BEGIN ent=%p\n", (void *)ent );
+		#endif
 		svgame.dllFuncs.pfnClientPutInServer( ent );
+		#if XASH_PS2
+		printf( "[XASH-PS2] STAGE=SV_PUT_CLIENT_CALLBACK_DONE ent=%p\n", (void *)ent );
+		#endif
 
 		if( sv.background )	// don't attack player in background mode
 			SetBits( ent->v.flags, FL_GODMODE|FL_NOTARGET );
@@ -2024,6 +2034,9 @@ SV_Spawn_f
 */
 static qboolean SV_Spawn_f( sv_client_t *cl )
 {
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=SV_CLIENT_SPAWN_CMD state=%d spawncount=%d\n", cl->state, svs.spawncount );
+	#endif
 	if( cl->state != cs_connected )
 		return false;
 
@@ -2053,11 +2066,17 @@ SV_Begin_f
 */
 static qboolean SV_Begin_f( sv_client_t *cl )
 {
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=SV_CLIENT_BEGIN_CMD state=%d\n", cl->state );
+	#endif
 	if( cl->state != cs_connected )
 		return false;
 
 	// now client is spawned
 	cl->state = cs_spawned;
+	#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=SV_CLIENT_BEGIN_DONE state=%d\n", cl->state );
+	#endif
 	return true;
 }
 
@@ -2105,6 +2124,13 @@ void SV_ExecuteClientCommand( sv_client_t *cl, char *s )
 	ucmd_t	*u;
 
 	Cmd_TokenizeString( s );
+	#if XASH_PS2
+	if( !Q_stricmp( Cmd_Argv(0), "spawn" ) ||
+		!Q_stricmp( Cmd_Argv(0), "begin" ) ||
+		!Q_stricmp( Cmd_Argv(0), "new" ) )
+		printf( "[XASH-PS2] STAGE=SV_CLIENT_SIGNON_CMD name=%s state=%d\n",
+			Cmd_Argv(0), cl->state );
+	#endif
 
 	for( u = ucmds; u->name; u++ )
 	{

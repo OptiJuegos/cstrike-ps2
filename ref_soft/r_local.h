@@ -69,7 +69,14 @@ extern byte	*r_temppool;
 #if XASH_LOW_MEMORY
 	#undef MAX_TEXTURES
 	#undef MAX_DECAL_SURFS
-	#define MAX_TEXTURES 1024
+	// CS 1.6 precaches over 1024 individual Studio and sprite frames.
+	// Keep the full preload: PS2 uses a smaller per-image name buffer below
+	// to avoid doubling the fixed texture table's RAM cost.
+	#if XASH_PS2
+		#define MAX_TEXTURES 2048
+	#else
+		#define MAX_TEXTURES 1024
+	#endif
 	#define MAX_DECAL_SURFS 256
 #endif
 
@@ -150,11 +157,15 @@ typedef struct
 	pixel_t					screen_major[256];
 #else
 	pixel_t					screen[256*256];
+	#if !XASH_PS2
 	unsigned int				screen32[256*256];
+	#endif
 #endif
 	byte					addmap[256*256];
 	byte					modmap[256*256];
+#if !XASH_PS2
 	pixel_t                 alphamap[3*1024*256];
+#endif
 	pixel_t					color;
 	qboolean is2d;
 	byte alpha;
@@ -337,7 +348,11 @@ extern gl_globals_t	tr;
 
 typedef struct image_s
 {
+	#if XASH_PS2
+	char		name[160];	// bounded PS2 table; game resource names fit
+	#else
 	char		name[256];	// game path, including extension (can be store image programs)
+	#endif
 	word		srcWidth;		// keep unscaled sizes
 	word		srcHeight;
 	word		width;		// upload width\height
@@ -362,12 +377,19 @@ typedef struct image_s
 	imagetype_t     type;
 	pixel_t		*pixels[4];				// mip levels
 	pixel_t		*alpha_pixels;				// mip levels
+	#if XASH_PS2
+	void		*ps2HudIndexed;	// packed original 256x256 HUD indices and converted palette
+	#endif
 
 
 	int		servercount;
 	uint		hashValue;
 	struct image_s	*nextHash;
 } image_t;
+
+#if XASH_PS2
+void R_PS2PrepareIndexedHud( image_t *tex );
+#endif
 
 #if 0
 
@@ -554,7 +576,7 @@ void R_DrawSpriteModel( cl_entity_t *e );
 // gl_studio.c
 //
 void R_StudioInit( void );
-void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded );
+void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded, qboolean *fileAdopted );
 void R_StudioLerpMovement( cl_entity_t *e, double time, vec3_t origin, vec3_t angles );
 float CL_GetSequenceDuration( cl_entity_t *ent, int sequence );
 struct mstudiotex_s *R_StudioGetTexture( cl_entity_t *e );
@@ -1303,7 +1325,40 @@ int CL_FxBlend( cl_entity_t *e );
 
 void R_SetUpWorldTransform (void);
 
+#if XASH_PS2
+// Compact equivalents of the 3 x 1024 x 256 alpha LUT. Each component is
+// blended with the exact integer formula used by R_BuildBlendMaps. Saves
+// 1.5 MiB EE BSS with ~2.6 KiB of small component LUTs.
+extern byte r_ps2BlendR[3][32 * 8];
+extern byte r_ps2BlendG[3][64 * 8];
+extern byte r_ps2BlendB[3][32 * 4];
+static inline pixel_t R_PS2BlendAlphaLow( int k, pixel_t src, pixel_t screen )
+{
+	uint color = (src & 0xFFC0) | 0x38;
+	uint m = color >> 8, j = color & 0xFF;
+	uint r1 = ((m >> 5) << 2) & MASK(5);
+	uint g1 = ((m >> 2) << 3) & MASK(6);
+	uint b1 = (m << 3) & MASK(5);
+	uint r, g, b, major, minor;
+	uint screenMajor = screen >> 8;
+
+	r1 |= MOVE_BIT(j,5,1) | MOVE_BIT(j,2,0);
+	g1 |= MOVE_BIT(j,7,2) | MOVE_BIT(j,4,1) | MOVE_BIT(j,1,0);
+	b1 |= MOVE_BIT(j,6,2) | MOVE_BIT(j,3,1) | MOVE_BIT(j,0,0);
+	r = r_ps2BlendR[k][r1 * 8 + ((screenMajor >> 5) & 7)];
+	g = r_ps2BlendG[k][g1 * 8 + ((screenMajor >> 2) & 7)];
+	b = r_ps2BlendB[k][b1 * 4 + (screenMajor & 3)];
+	major = (((r >> 2) & MASK(3)) << 5) |
+		(((g >> 3) & MASK(3)) << 2) | ((b >> 3) & MASK(2));
+	minor = MOVE_BIT(r,1,5) | MOVE_BIT(r,0,2) |
+		MOVE_BIT(g,2,7) | MOVE_BIT(g,1,4) | MOVE_BIT(g,0,1) |
+		MOVE_BIT(b,2,6) | MOVE_BIT(b,1,3) | MOVE_BIT(b,0,0);
+	return (pixel_t)((major << 8) | (minor & ~0x3F) | (screen & 0x3F));
+}
+#define BLEND_ALPHA_LOW(alpha, src, screen) R_PS2BlendAlphaLow( (alpha), (src), (screen) )
+#else
 #define BLEND_ALPHA_LOW(alpha, src, screen) (vid.alphamap[((alpha) << 18) | (((src) & 0xff00) << 2) | ((screen) >> 6)] | ((screen) & 0x3f))
+#endif
 #define BLEND_ALPHA(alpha, src, dst) (alpha) > 3?BLEND_ALPHA_LOW(7 - 1 - (alpha), (dst), (src)) : BLEND_ALPHA_LOW((alpha)-1, (src), (dst))
 #define BLEND_ADD(src, screen) vid.addmap[((src)& 0xff00)|((screen)>>8)] << 8 | ((screen) & 0xff) | (((src) & 0xff) >> 0);
 #define BLEND_COLOR(src, color) vid.modmap[((src) & 0xff00)|((color)>>8)] << 8 | ((src) & (color) & 0xff) | (((src) & 0xff) >> 3);

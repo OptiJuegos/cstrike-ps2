@@ -63,6 +63,11 @@ void MSG_StartWriting( sizebuf_t *sb, void *pData, int nBytes, int iStartBit, in
 {
 	// make sure it's dword aligned and padded.
 	Assert(((dword)pData & 3 ) == 0 );
+#if XASH_PS2
+	// Assert is compiled out; a real EE faults on these, PCSX2 does not
+	if(( (dword)pData & 3 ) != 0 )
+		printf( "[XASH-PS2] MSG_MISALIGNED %p\n", pData );
+#endif
 
 	sb->pDebugName = "Unnamed";
 	sb->pData = (byte *)pData;

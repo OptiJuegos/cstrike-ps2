@@ -970,7 +970,8 @@ qboolean CL_AddVisibleEntity( cl_entity_t *ent, int entityType )
 	}
 
 	// don't add the player in firstperson mode
-	if( RP_LOCALCLIENT( ent ) && !CL_IsThirdPerson( ) && ( ent->index == cl.viewentity ))
+	// splitscreen keeps it: player 2's view shows player 1, the ref culls it in view 1
+	if( RP_LOCALCLIENT( ent ) && !CL_IsThirdPerson( ) && ( ent->index == cl.viewentity ) && !V_SplitActive( ))
 		return false;
 
 	if( entityType == ET_BEAM )
@@ -1410,6 +1411,10 @@ qboolean CL_GetMovieSpatialization( rawchan_t *ch )
 
 void CL_ExtraUpdate( void )
 {
-	clgame.dllFuncs.IN_Accumulate();
+	if( clgame.dllFuncs.IN_Accumulate ) // NULL until the client dll loads (boot plaque draws before)
+		clgame.dllFuncs.IN_Accumulate();
+#if XASH_PS2
+	if( !cls.initialized ) return; // boot plaque: audsrv_wait_audio blocks here before the main loop runs
+#endif
 	S_ExtraUpdate();
 }

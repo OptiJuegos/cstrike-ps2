@@ -19,6 +19,7 @@ GNU General Public License for more details.
 #include "library.h"
 #include "triangleapi.h"
 #include "ref_common.h"
+#include "ps2_perf.h"
 #if XASH_PSP
 #include "platform/psp/psp_perf.h"
 #endif
@@ -1803,6 +1804,10 @@ void SV_Physics( void )
 
 	svgame.globals->time = sv.time;
 
+#if !XASH_DEDICATED
+	CL_SplitServerFrame(); // splitscreen player 2 moves before the bots do
+#endif
+
 	// let the progs know that a new frame has started
 #if XASH_PSP
 	{
@@ -1812,21 +1817,29 @@ void SV_Physics( void )
 		psp_perf.bots += Sys_DoubleTime() - perf_start;
 	}
 #else
-	svgame.dllFuncs.pfnStartFrame();
+	{
+		PS2_PERF_BEGIN( BOTS );
+		svgame.dllFuncs.pfnStartFrame();
+		PS2_PERF_END( BOTS );
+	}
 #endif
 
 	// treat each object in turn
-	for( i = 0; i < svgame.numEntities; i++ )
 	{
-		ent = EDICT_NUM( i );
+		PS2_PERF_BEGIN( SVENT );
+		for( i = 0; i < svgame.numEntities; i++ )
+		{
+			ent = EDICT_NUM( i );
 
-		if( !SV_IsValidEdict( ent ))
-			continue;
+			if( !SV_IsValidEdict( ent ))
+				continue;
 
-		if( i > 0 && i <= svs.maxclients )
-			continue;
+			if( i > 0 && i <= svs.maxclients )
+				continue;
 
-		SV_Physics_Entity( ent );
+			SV_Physics_Entity( ent );
+		}
+		PS2_PERF_END( SVENT );
 	}
 
 	if( svgame.globals->force_retouch != 0.0f )

@@ -267,7 +267,7 @@ qboolean Sound_Process( wavdata_t **wav, int rate, int width, uint flags )
 		{
 			Mem_Free( snd->buffer );		// free original image buffer
 			snd->buffer = Sound_Copy( snd->size );	// unzone buffer (don't touch image.tempbuffer)
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 			// the temp buffer keeps the size of the biggest sound processed so far
 			Mem_Free( sound.tempbuffer );
 			sound.tempbuffer = NULL;

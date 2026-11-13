@@ -20,6 +20,10 @@ GNU General Public License for more details.
 #include "library.h"
 #include "ref_common.h"
 
+#if XASH_PS2
+model_t *Mod_PSPKnownModel( int i ); // model.c: already-loaded Studio models
+#endif
+
 typedef int (*STUDIOAPI)( int, sv_blending_interface_t**, server_studio_api_t*,  float (*transform)[3][4], float (*bones)[MAXSTUDIOBONES][3][4] );
 
 typedef struct mstudiocache_s
@@ -948,6 +952,30 @@ qboolean Mod_GetStudioBounds( const char *name, vec3_t mins, vec3_t maxs )
 	if( !Q_strstr( name, "models" ) || !Q_strstr( name, ".mdl" ))
 		return false;
 
+#if XASH_PS2
+	/* Consistency checks query already-precached 2+ MB player models.
+	 * Their model-owned Studio header still holds every bone, vertex and
+	 * animation needed for exact bounds. Reading another full source file
+	 * just to calculate bounds can exhaust the 32 MiB EE address space. */
+	{
+		int i;
+		model_t *cached;
+		for( i = 0; ( cached = Mod_PSPKnownModel( i )) != NULL; i++ )
+		{
+			if( cached->type != mod_studio || !cached->mempool || !cached->cache.data ||
+				Q_stricmp( cached->name, name ))
+				continue;
+			if( ((studiohdr_t *)cached->cache.data)->ident != IDSTUDIOHEADER )
+				break;
+			VectorClear( mins );
+			VectorClear( maxs );
+			Mod_StudioComputeBounds( cached->cache.data, mins, maxs, false );
+			printf( "[XASH-PS2] STAGE=STUDIO_BOUNDS_CACHED name=%s\n", name );
+			return true;
+		}
+	}
+#endif
+
 	f = FS_LoadFile( name, NULL, false );
 	if( !f ) return false;
 
@@ -1028,12 +1056,19 @@ studiohdr_t *R_StudioLoadHeader( model_t *mod, const void *buffer )
 	{
 		Con_Printf( S_ERROR "%s has wrong version number (%i should be %i)\n", mod->name, i, STUDIO_VERSION );
 		return NULL;
-	}	
+	}
+
+	// every bone array is MAXSTUDIOBONES long: refuse instead of writing past them
+	if( phdr->numbones > MAXSTUDIOBONES )
+	{
+		Con_Printf( S_ERROR "%s has %i bones (max %i)\n", mod->name, phdr->numbones, MAXSTUDIOBONES );
+		return NULL;
+	}
 
 	return (studiohdr_t *)buffer;
 }
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 /*
 =================
 Shared player animations
@@ -1111,7 +1146,7 @@ static studiohdr_t *Mod_StudioShareAnims( model_t *mod, studiohdr_t *hdr )
 	model_t		*srcmod = NULL;
 	int		size[MAXSTUDIOSEQUENCES];
 	qboolean	shared[MAXSTUDIOSEQUENCES];
-	int		i, j, k, slot, lo, hi, kept, newlength, delta, pos, nshared = 0;
+	int		i, j, k, slot, lo, hi, kept, newlength, delta, pos, pad, nshared = 0;
 
 	if( Q_strnicmp( mod->name, "models/player/", 14 ) || hdr->numseqgroups != 1
 		|| hdr->numseq <= 0 || hdr->numseq > MAXSTUDIOSEQUENCES || hdr->studiohdr2index )
@@ -1194,7 +1229,10 @@ static studiohdr_t *Mod_StudioShareAnims( model_t *mod, studiohdr_t *hdr )
 
 	// new block: everything before the animations, the sequences that
 	// differ, everything after
-	newlength = hdr->length - ( hi - lo ) + kept;
+	// pad so the tables after the animations keep their alignment mod 16:
+	// anim data sizes are only even, an odd shift faults on the EE
+	pad = ( hi - lo - kept ) & 15;
+	newlength = hdr->length - ( hi - lo ) + kept + pad;
 	delta = newlength - hdr->length;
 	out = Mem_Malloc( mod->mempool, newlength ); // mod is loadmodel, its pool holds hdr too
 
@@ -1208,7 +1246,8 @@ static studiohdr_t *Mod_StudioShareAnims( model_t *mod, studiohdr_t *hdr )
 		memcpy((byte *)out + pos, (byte *)hdr + outseq[i].animindex, size[i] );
 		pos += size[i];
 	}
-	memcpy((byte *)out + pos, (byte *)hdr + hi, hdr->length - hi );
+	memset((byte *)out + pos, 0, pad );
+	memcpy((byte *)out + pos + pad, (byte *)hdr + hi, hdr->length - hi );
 
 	// offsets past the animations moved down by -delta
 	out->length = newlength;
@@ -1276,7 +1315,7 @@ static studiohdr_t *Mod_StudioShareAnims( model_t *mod, studiohdr_t *hdr )
 	anim_shares[slot].dep = mod;
 	anim_shares[slot].src = srcmod;
 
-	Con_Reportf( "S_PSP: %s uses %d of its %d animations from %s, %d KB saved\n",
+	Con_Reportf( "S_STUDIO_SHARE: %s uses %d of its %d animations from %s, %d KB saved\n",
 		mod->name, nshared, out->numseq, srcmod->name, -delta / 1024 );
 
 	Mem_Free( hdr );
@@ -1314,14 +1353,14 @@ void Mod_StudioUnshare( model_t *mod )
 		}
 	}
 }
-#endif // XASH_PSP
+#endif // XASH_PSP || XASH_PS2
 
 /*
 =================
 Mod_LoadStudioModel
 =================
 */
-void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded )
+void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded, qboolean *fileAdopted )
 {
 	studiohdr_t	*phdr;
 
@@ -1374,7 +1413,7 @@ void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded )
 				Mem_Free( buffer2 ); // release T.mdl
 			}
 		}
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 		else if( phdr->texturedataindex > 0 && phdr->textureindex > 0
 			&& phdr->textureindex + phdr->numtextures * sizeof( mstudiotexture_t ) <= phdr->texturedataindex )
 		{
@@ -1386,6 +1425,21 @@ void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded )
 			// in the texture headers, so they are saved and put back after
 			// (the buffer is CRC checked later).
 			studiohdr_t	*src = (studiohdr_t *)buffer;
+#if XASH_PS2
+			// model.c has already checksummed the untouched original bytes.
+			// The model needs its animation/mesh prefix, not the source skin
+			// pixels once ref_soft has uploaded them. Transfer and shrink
+			// the very same FS allocation instead of making a 2.06 MB copy.
+#if !XASH_DEDICATED
+			ref.dllFuncs.Mod_StudioLoadTextures( mod, src );
+#endif
+			loadmodel->cache.data = Mem_PS2RehomeShrink( loadmodel->mempool, src, src->texturedataindex );
+			*fileAdopted = true;
+			phdr = (studiohdr_t *)loadmodel->cache.data;
+			printf( "[XASH-PS2] STAGE=STUDIO_REHOME name=%s kept=%u original=%u\n",
+				mod->name, (unsigned)phdr->texturedataindex, (unsigned)phdr->length );
+			phdr->length = phdr->texturedataindex;
+#else
 			size_t		texsize = src->numtextures * sizeof( mstudiotexture_t );
 			byte		*texinfo = (byte *)src + src->textureindex;
 			byte		*backup = Mem_Malloc( loadmodel->mempool, texsize );
@@ -1401,9 +1455,12 @@ void Mod_LoadStudioModel( model_t *mod, const void *buffer, qboolean *loaded )
 
 			phdr = (studiohdr_t *)loadmodel->cache.data;
 			phdr->length = phdr->texturedataindex;	// update model size
+#endif
 
+				#if XASH_PSP || XASH_PS2
 			phdr = Mod_StudioShareAnims( loadmodel, phdr );
 			loadmodel->cache.data = phdr;
+			#endif
 		}
 #endif
 		else

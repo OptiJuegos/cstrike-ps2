@@ -75,6 +75,9 @@ typedef struct imglib_s
 	uint			ptr;		// safe image pointer
 	int			bpp;		// PFDesc[type].bpp
 	byte			*rgba;		// image pointer (see image_type for details)
+#if XASH_PS2
+	qboolean		borrow_source;	// inline #... buffer remains valid for synchronous upload
+#endif
 
 	// current cubemap state
 	int			source_width;	// locked cubemap dims (all wrong sides will be automatically resampled)

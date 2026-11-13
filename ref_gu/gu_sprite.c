@@ -46,6 +46,139 @@ void R_SpriteInit( void )
 	r_sprite_lighting = gEngfuncs.Cvar_Get( "r_sprite_lighting", "1", FCVAR_ARCHIVE, "enables sprite lighting (blood etc)" );
 }
 
+#if XASH_PS2
+#define SPRITE_CROP_MIN_FRAMES	15 // smoke and explosions; beams and TriAPI stretch the whole texture
+
+static const byte	*sprite_palette;
+static int		sprite_texformat;
+extern int		ps2_gs_trace; // gs_gu.c: debug prints around GS uploads
+
+/*
+====================
+R_SpriteCropAxis
+
+Textures are power of two: grow the range to the next size when rounding
+it down would lose more than a quarter of its pixels.
+====================
+*/
+static void R_SpriteCropAxis( int size, int *first, int *last )
+{
+	int	lo = Q_max( *first - 1, 0 ); // the empty texel keeps the filtered edge fading out
+	int	hi = Q_min( *last + 1, size - 1 );
+	int	len = hi - lo + 1;
+	int	pot = 1;
+
+	while( pot * 2 <= len )
+		pot <<= 1;
+	if( pot * 4 < len * 3 )
+		pot <<= 1;
+
+	if( pot >= size )
+	{
+		lo = 0;
+		hi = size - 1;
+	}
+	else if( pot > len )
+	{
+		lo = Q_max( lo - ( pot - len ) / 2, 0 );
+		if( lo + pot > size )
+			lo = size - pot;
+		hi = lo + pot - 1;
+	}
+
+	*first = lo;
+	*last = hi;
+}
+
+/*
+====================
+R_SpriteCropFrame
+
+Effect sprites are mostly empty margin. Returns a copy of the frame without it,
+to free after the upload, or NULL to use the frame as it is. The quad follows
+the new origin and size, so nothing moves on screen.
+====================
+*/
+static byte *R_SpriteCropFrame( const model_t *mod, const byte *pin, const dspriteframe_t *in, dspriteframe_t *out )
+{
+	const byte	*src = pin + sizeof( dspriteframe_t );
+	qboolean	empty[256];
+	int		x0 = in->width, x1 = -1, y0 = in->height, y1 = -1;
+	int		x, y, width, height;
+	byte		*copy;
+
+	if( FBitSet( mod->flags, MODEL_CLIENT ) || mod->numframes < SPRITE_CROP_MIN_FRAMES
+		|| sprite_version != SPRITE_VERSION_HL || !sprite_palette )
+		return NULL;
+
+	for( x = 0; x < 256; x++ )
+	{
+		switch( sprite_texformat )
+		{
+		case SPR_ADDITIVE:
+			empty[x] = !sprite_palette[x*3] && !sprite_palette[x*3+1] && !sprite_palette[x*3+2];
+			break;
+		case SPR_INDEXALPHA:
+			empty[x] = x == 0;
+			break;
+		case SPR_ALPHTEST:
+			empty[x] = x == 255;
+			break;
+		default:
+			return NULL; // every pixel is opaque
+		}
+	}
+
+	for( y = 0; y < in->height; y++ )
+	{
+		for( x = 0; x < in->width; x++ )
+		{
+			if( empty[src[y * in->width + x]] )
+				continue;
+			if( x < x0 ) x0 = x;
+			if( x > x1 ) x1 = x;
+			if( y < y0 ) y0 = y;
+			y1 = y;
+		}
+	}
+
+	if( x1 < 0 )
+		return NULL;
+
+	R_SpriteCropAxis( in->width, &x0, &x1 );
+	R_SpriteCropAxis( in->height, &y0, &y1 );
+	width = x1 - x0 + 1;
+	height = y1 - y0 + 1;
+
+	if( width == in->width && height == in->height )
+		return NULL;
+
+	copy = malloc( sizeof( dspriteframe_t ) + width * height );
+	if( !copy )
+		return NULL;
+
+	*out = *in;
+	out->origin[0] = in->origin[0] + x0;
+	out->origin[1] = in->origin[1] - y0;
+	out->width = width;
+	out->height = height;
+	memcpy( copy, out, sizeof( dspriteframe_t ));
+	for( y = 0; y < height; y++ )
+		memcpy( copy + sizeof( dspriteframe_t ) + y * width, src + ( y0 + y ) * in->width + x0, width );
+
+	return copy;
+}
+#endif
+
+#if XASH_PS2
+static float R_SpriteFrameRadius( const mspriteframe_t *frame )
+{
+	const float x = Q_max( fabsf( frame->left ), fabsf( frame->right ));
+	const float y = Q_max( fabsf( frame->up ), fabsf( frame->down ));
+	return sqrtf( x * x + y * y );
+}
+#endif
+
 /*
 ====================
 R_SpriteLoadFrame
@@ -56,12 +189,17 @@ upload a single frame
 static const dframetype_t *R_SpriteLoadFrame( model_t *mod, const void *pin, mspriteframe_t **ppframe, int num )
 {
 	dspriteframe_t	pinframe;
+	dspriteframe_t	drawn;
 	mspriteframe_t	*pspriteframe;
 	int		gl_texturenum = 0;
 	char		texname[128];
 	int		bytes = 1;
+#if XASH_PS2
+	byte		*cropped;
+#endif
 
 	memcpy( &pinframe, pin, sizeof(dspriteframe_t));
+	drawn = pinframe;
 
 	if( sprite_version == SPRITE_VERSION_32 )
 		bytes = 4;
@@ -75,19 +213,40 @@ static const dframetype_t *R_SpriteLoadFrame( model_t *mod, const void *pin, msp
 	else
 	{
 		Q_snprintf( texname, sizeof( texname ), "#%s(%s:%i%i).spr", sprite_name, group_suffix, num / 10, num % 10 );
+#if XASH_PS2
+		ps2_gs_trace = 1; // debug: real-console hang after the first world sprite read
+		printf( "[XASH-PS2] SPR %s %dx%d fmt=%d pin=%p\n", texname, pinframe.width, pinframe.height, sprite_texformat, pin );
+		cropped = R_SpriteCropFrame( mod, pin, &pinframe, &drawn );
+		printf( "[XASH-PS2] SPR crop=%p %dx%d\n", cropped, drawn.width, drawn.height );
+		if( cropped )
+		{
+			gl_texturenum = GL_LoadTexture( texname, cropped, drawn.width * drawn.height, r_texFlags );
+			free( cropped );
+		}
+		else
+#endif
 		gl_texturenum = GL_LoadTexture( texname, pin, pinframe.width * pinframe.height * bytes, r_texFlags );
+#if XASH_PS2
+		printf( "[XASH-PS2] SPR tex=%d\n", gl_texturenum );
+		ps2_gs_trace = 0;
+#endif
 	}
 
 	// setup frame description
 	pspriteframe = Mem_Malloc( mod->mempool, sizeof( mspriteframe_t ));
-	pspriteframe->width = pinframe.width;
+	pspriteframe->width = pinframe.width; // width and height stay the artist's: game code reads them
 	pspriteframe->height = pinframe.height;
-	pspriteframe->up = pinframe.origin[1];
-	pspriteframe->left = pinframe.origin[0];
-	pspriteframe->down = pinframe.origin[1] - pinframe.height;
-	pspriteframe->right = pinframe.width + pinframe.origin[0];
+	pspriteframe->up = drawn.origin[1];
+	pspriteframe->left = drawn.origin[0];
+	pspriteframe->down = drawn.origin[1] - drawn.height;
+	pspriteframe->right = drawn.width + drawn.origin[0];
 	pspriteframe->gl_texturenum = gl_texturenum;
 	*ppframe = pspriteframe;
+#if XASH_PS2
+	// Every frame, including groups and angles, contributes to the PVS bound.
+	msprite_t *sprite = mod->cache.data;
+	sprite->radius = Q_max( sprite->radius, R_SpriteFrameRadius( pspriteframe ));
+#endif
 
 	return ( const dframetype_t* )(( const byte* )pin + sizeof( dspriteframe_t ) + pinframe.width * pinframe.height * bytes );
 }
@@ -108,8 +267,9 @@ static const dframetype_t *R_SpriteLoadGroup( model_t *mod, const void *pin, msp
 	int		i, groupsize, numframes;
 	const void		*ptemp;
 
+	// Sprite lumps sit at odd offsets after the 768-byte palette: copy, a real EE faults on unaligned lw
 	pingroup = (const dspritegroup_t *)pin;
-	numframes = pingroup->numframes;
+	memcpy( &numframes, &pingroup->numframes, sizeof( numframes ));
 
 	groupsize = sizeof( mspritegroup_t ) + (numframes - 1) * sizeof( pspritegroup->frames[0] );
 	pspritegroup = Mem_Calloc( mod->mempool, groupsize );
@@ -122,7 +282,7 @@ static const dframetype_t *R_SpriteLoadGroup( model_t *mod, const void *pin, msp
 
 	for( i = 0; i < numframes; i++ )
 	{
-		*poutintervals = pin_intervals->interval;
+		memcpy( poutintervals, &pin_intervals->interval, sizeof( float ));
 		if( *poutintervals <= 0.0f )
 			*poutintervals = 1.0f; // set error value
 		poutintervals++;
@@ -166,6 +326,11 @@ void Mod_LoadSpriteModel( model_t *mod, const void *buffer, qboolean *loaded, ui
 	// every frame (~1 MB in a CS map). At 480x272 the aliasing is not visible.
 	r_texFlags = texFlags | TF_NOMIPMAP;
 	sprite_version = pin->version;
+#if XASH_PS2
+	sprite_palette = ( numi && *numi == 256 ) ? (const byte *)( numi + 1 ) : NULL;
+	sprite_texformat = psprite->texFormat;
+	psprite->radius = 0.0f;
+#endif
 	Q_strncpy( sprite_name, mod->name, sizeof( sprite_name ));
 	COM_StripExtension( sprite_name );
 
@@ -210,7 +375,8 @@ void Mod_LoadSpriteModel( model_t *mod, const void *buffer, qboolean *loaded, ui
 
 	for( i = 0; i < mod->numframes; i++ )
 	{
-		frametype_t frametype = pframetype->type;
+		frametype_t frametype;
+		memcpy( &frametype, &pframetype->type, sizeof( frametype )); // unaligned in the file
 		psprite->frames[i].type = (spriteframetype_t)frametype;
 
 		switch( frametype )
@@ -340,6 +506,9 @@ void Mod_LoadMapSprite( model_t *mod, const void *buffer, size_t size, qboolean 
 		pspriteframe->down = ( h >> 1 ) - h;
 		pspriteframe->right = w + -( w >> 1 );
 		pspriteframe->gl_texturenum = GL_LoadTextureInternal( texname, &temp, TF_IMAGE );
+#if XASH_PS2
+		psprite->radius = Q_max( psprite->radius, R_SpriteFrameRadius( pspriteframe ));
+#endif
 
 		xl += w;
 		if( xl >= pix->width )

@@ -65,7 +65,15 @@ GNU General Public License for more details.
 
 #define XASH_ENGINE_NAME "Xash3D FWGS"
 
-#define DEFAULT_RENDERERS { "gl", "gles1", "gles2", "soft" }
-#define DEFAULT_RENDERERS_LEN 4
+#if XASH_PS2
+			/* Prefer the stable software renderer until the hardware world,
+			 * Studio depth and HUD composition are validated on a live PS2.
+			 * Keep gs selectable for explicit isolated development tests. */
+			#define DEFAULT_RENDERERS { "soft", "gs" }
+		#define DEFAULT_RENDERERS_LEN 2
+#else
+	#define DEFAULT_RENDERERS { "gl", "gles1", "gles2", "soft" }
+	#define DEFAULT_RENDERERS_LEN 4
+#endif
 
 #endif//COM_STRINGS_H

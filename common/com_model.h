@@ -45,6 +45,13 @@ typedef enum
 	mod_studio
 } modtype_t;
 
+// PS2 keeps one gray byte per lightmap luxel (mod_bmodel.c: Mod_LoadLighting)
+#if XASH_PS2
+typedef byte lightsample_t;
+#else
+typedef color24 lightsample_t;
+#endif
+
 typedef struct mplane_s
 {
 	vec3_t		normal;
@@ -126,7 +133,7 @@ typedef struct
 	int		flags;		// sky or slime, no lightmap or 256 subdivision
 } mtexinfo_t;
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 typedef struct
 {
 	float uv[2];
@@ -226,12 +233,15 @@ typedef struct mextrasurf_s
 	float		lmvecs[2][4];
 
 	color24		*deluxemap;	// note: this is the actual deluxemap data for this surface
+	#if !XASH_PS2
 	byte		*shadowmap;	// note: occlusion map for this surface
+	#endif
 // begin userdata
 	struct msurface_s	*lightmapchain;	// lightmapped polys
 	struct mextrasurf_s	*detailchain;	// for detail textures drawing
 	mfacebevel_t	*bevel;		// for exact face traceline
 	struct mextrasurf_s	*lumachain;	// draw fullbrights
+	#if !XASH_PS2
 	struct cl_entity_s	*parent;		// upcast to owner entity
 
 	int		mirrortexturenum;	// gl texnum
@@ -241,8 +251,15 @@ typedef struct mextrasurf_s
 	unsigned short	grasscount;	// number of bushes per polygon (used to determine total VBO size)
 	unsigned short	numverts;		// world->vertexes[]
 	int		firstvertex;	// fisrt look up in tr.tbn_vectors[], then acess to world->vertexes[]
+	#endif
 
+#if XASH_PS2
+		// ref_gu reads bounds, light vectors and its chains. bevel stays NULL.
+		// Grass, mirrors and reserved slots are never read on PS2.
+	int		reserved[1];
+#else
 	int		reserved[32];	// just for future expansions or mod-makers
+#endif
 } mextrasurf_t;
 
 struct msurface_s
@@ -275,7 +292,7 @@ struct msurface_s
 	int		cached_light[MAXLIGHTMAPS];	// values currently used in lightmap
 	mextrasurf_t	*info;		// pointer to surface extradata (was cached_dlight)
 
-	color24		*samples;		// note: this is the actual lightmap data for this surface
+	lightsample_t	*samples;		// note: this is the actual lightmap data for this surface
 	decal_t		*pdecals;
 };
 
@@ -358,7 +375,7 @@ typedef struct model_s
 
 	byte		*visdata;
 
-	color24		*lightdata;
+	lightsample_t	*lightdata;
 	char		*entities;
 //
 // additional model data
@@ -545,7 +562,7 @@ typedef struct
 #define MAX_MOVIES		8
 #define MAX_CDTRACKS	32
 #define MAX_CLIENT_SPRITES	256	// SpriteTextures
-#ifdef __PSP__
+#if defined( __PSP__ ) || defined( __PS2__ )
 #define MAX_EFRAGS		4096	// CS maps have few static entities, half saves 64 KB
 #else
 #define MAX_EFRAGS		8192	// Arcane Dimensions required

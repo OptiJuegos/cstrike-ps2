@@ -303,6 +303,22 @@ qboolean SV_CheckClientVisiblity( sv_client_t *cl, const byte *mask )
 			return true; // visible from portal camera view
 	}
 
+#if !XASH_DEDICATED
+	// splitscreen: the local client also hears and sees for player 2
+	{
+		edict_t	*p2 = CL_SplitViewEdict();
+
+		if( p2 && p2 != cl->edict && !FBitSet( cl->flags, FCL_FAKECLIENT ))
+		{
+			VectorAdd( p2->v.origin, p2->v.view_ofs, vieworg );
+			leaf = Mod_PointInLeaf( vieworg, sv.worldmodel->nodes );
+
+			if( CHECKVISBIT( mask, leaf->cluster ))
+				return true;
+		}
+	}
+#endif
+
 	// not visible from any viewpoint
 	return false;
 }
@@ -1081,6 +1097,10 @@ edict_t* SV_AllocPrivateData( edict_t *ent, string_t className )
 	LINK_ENTITY_FUNC	SpawnEdict;
 
 	pszClassName = STRING( className );
+#if XASH_PS2
+	if( pszClassName && !Q_stricmp( pszClassName, "info_player_deathmatch" ))
+		printf( "[XASH-PS2] STAGE=DM_SPAWN_ALLOC_BEGIN\n" );
+#endif
 
 	if( !ent )
 	{
@@ -1097,6 +1117,10 @@ edict_t* SV_AllocPrivateData( edict_t *ent, string_t className )
 	
 	// allocate edict private memory (passed by dlls)
 	SpawnEdict = SV_GetEntityClass( pszClassName );
+#if XASH_PS2
+	if( pszClassName && !Q_stricmp( pszClassName, "info_player_deathmatch" ))
+		printf( "[XASH-PS2] STAGE=DM_SPAWN_EXPORT_RESOLVED ptr=%p\n", (void *)SpawnEdict );
+#endif
 
 	if( !SpawnEdict )
 	{
@@ -1120,6 +1144,10 @@ edict_t* SV_AllocPrivateData( edict_t *ent, string_t className )
 	}
 
 	SpawnEdict( &ent->v );
+#if XASH_PS2
+	if( pszClassName && !Q_stricmp( pszClassName, "info_player_deathmatch" ))
+		printf( "[XASH-PS2] STAGE=DM_SPAWN_CONSTRUCTOR_DONE\n" );
+#endif
 
 	return ent;
 }
@@ -2699,6 +2727,17 @@ void GAME_EXPORT pfnMessageEnd( void )
 			MSG_WriteChar( &sv.multicast, 0 ); // write null string
 	}
 
+#if !XASH_DEDICATED
+	// splitscreen player 2 is a fake client: SV_Multicast drops its messages, the engine HUD reads them;
+	// MSG_INIT ones (WeaponList) go out at map start, before player 2 joins
+	if(( svgame.msg_index > 0 && svgame.msg_dest == MSG_INIT ) || (( svgame.msg_dest == MSG_ONE || svgame.msg_dest == MSG_ONE_UNRELIABLE )
+		&& svgame.msg_ent && svgame.msg_ent == CL_SplitEdict( )))
+	{
+		CL_SplitUserMessage( name, MSG_GetData( &sv.multicast ) + MSG_GetNumBytesWritten( &sv.multicast ) - svgame.msg_realsize,
+			svgame.msg_realsize );
+	}
+#endif
+
 	if( !VectorIsNull( svgame.msg_org )) org = svgame.msg_org;
 	svgame.msg_dest = bound( MSG_BROADCAST, svgame.msg_dest, MSG_SPEC );
 
@@ -3002,6 +3041,20 @@ static struct str64_s
 	size_t numoverflows;
 	size_t totalalloc;
 } str64;
+#else
+// The game library calls ALLOC_STRING on every weapon deploy (ReGameDLL's
+// DefaultDeploy) and every named item, and a plain copy per call grows the
+// pool until the map ends: hours of play ran consoles out of memory. Equal
+// strings share one copy instead; the game never writes into them.
+#define SV_STRING_HASH	1024
+
+typedef struct sv_string_s
+{
+	struct sv_string_s	*next;
+	char		str[1];
+} sv_string_t;
+
+static sv_string_t	*sv_strings[SV_STRING_HASH];
 #endif
 
 /*
@@ -3023,6 +3076,7 @@ void SV_EmptyStringPool( void )
 	}
 #else
 	Mem_EmptyPool( svgame.stringspool );
+	memset( sv_strings, 0, sizeof( sv_strings ));
 #endif
 }
 
@@ -3156,6 +3210,7 @@ void SV_FreeStringPool( void )
 		Mem_Free( str64.staticstringarray );
 #else
 	Mem_FreePool( &svgame.stringspool );
+	memset( sv_strings, 0, sizeof( sv_strings ));
 #endif
 }
 
@@ -3212,7 +3267,24 @@ string_t GAME_EXPORT SV_AllocString( const char *szValue )
 
 	return newString - svgame.globals->pStringBase;
 #else
-	newString = _copystring( svgame.stringspool, szValue, __FILE__, __LINE__ );
+	{
+		uint		hash = COM_HashKey( szValue, SV_STRING_HASH );
+		sv_string_t	*s;
+		size_t		len;
+
+		for( s = sv_strings[hash]; s; s = s->next )
+		{
+			if( !Q_strcmp( s->str, szValue ))
+				return s->str - svgame.globals->pStringBase;
+		}
+
+		len = Q_strlen( szValue );
+		s = Mem_Malloc( svgame.stringspool, sizeof( *s ) + len );
+		memcpy( s->str, szValue, len + 1 );
+		s->next = sv_strings[hash];
+		sv_strings[hash] = s;
+		newString = s->str;
+	}
 	return newString - svgame.globals->pStringBase;
 #endif
 }
@@ -4553,7 +4625,15 @@ extended iface stubs
 */
 static int GAME_EXPORT pfnGetFileSize( char *filename )
 {
-	return 0;
+	// the game library asks with Windows separators (bot chatter, hostages)
+	char normalized[MAX_OSPATH];
+	char *p;
+	if( !COM_CheckString( filename ))
+		return -1;
+	Q_strncpy( normalized, filename, sizeof( normalized ));
+	for( p = normalized; *p; p++ )
+		if( *p == '\\' ) *p = '/';
+	return (int)FS_FileSize( normalized, false );
 }
 static unsigned int GAME_EXPORT pfnGetApproxWavePlayLen(const char *filepath)
 {
@@ -4789,7 +4869,15 @@ qboolean SV_ParseEdict( char **pfile, edict_t *ent )
 		if( ++numpairs >= 256 ) break;
 	}
 	
+#if XASH_PS2
+	if( classname && !Q_stricmp( classname, "info_player_deathmatch" ))
+		printf( "[XASH-PS2] STAGE=DM_PARSE_BEFORE_PRIVATE\n" );
+#endif
 	ent = SV_AllocPrivateData( ent, ALLOC_STRING( classname ));
+#if XASH_PS2
+	if( classname && !Q_stricmp( classname, "info_player_deathmatch" ))
+		printf( "[XASH-PS2] STAGE=DM_PARSE_AFTER_PRIVATE\n" );
+#endif
 
 	if( !SV_IsValidEdict( ent ) || FBitSet( ent->v.flags, FL_KILLME ))
 	{
@@ -4899,6 +4987,10 @@ void SV_LoadFromFile( const char *mapname, char *entities )
 	qboolean	create_world = true;
 	int	inhibited;
 	edict_t	*ent;
+#if XASH_PS2
+	int ps2SpawnCount = 0;
+	printf( "[XASH-PS2] STAGE=ENTITY_SPAWN_BEGIN map=%s\n", mapname );
+#endif
 
 	Assert( entities != NULL );
 
@@ -4912,18 +5004,35 @@ void SV_LoadFromFile( const char *mapname, char *entities )
 		{
 			if( token[0] != '{' )
 				Host_Error( "ED_LoadFromFile: found %s when expecting {\n", token );
+#if XASH_PS2
+				if( ps2SpawnCount >= 74 && ps2SpawnCount <= 77 )
+					printf( "[XASH-PS2] STAGE=ENTITY_PARSE_BEGIN count=%d\n", ps2SpawnCount );
+#endif
 
 			if( create_world )
 			{
 				create_world = false;
 				ent = EDICT_NUM( 0 ); // already initialized
 			}
-			else ent = SV_AllocEdict();
+				else ent = SV_AllocEdict();
+#if XASH_PS2
+				if( ps2SpawnCount >= 74 && ps2SpawnCount <= 77 )
+					printf( "[XASH-PS2] STAGE=ENTITY_ALLOC_DONE count=%d\n", ps2SpawnCount );
+#endif
 
 			if( !SV_ParseEdict( &entities, ent ))
 				continue;
+#if XASH_PS2
+				if( ps2SpawnCount >= 74 && ps2SpawnCount <= 77 )
+					printf( "[XASH-PS2] STAGE=ENTITY_PARSE_DONE count=%d\n", ps2SpawnCount );
+#endif
 
-			if( svgame.dllFuncs.pfnSpawn( ent ) == -1 )
+#if XASH_PS2
+				if(( ps2SpawnCount % 16 ) == 0 || ( ps2SpawnCount >= 60 && ps2SpawnCount <= 90 ))
+					printf( "[XASH-PS2] STAGE=ENTITY_SPAWN_BEFORE count=%d\n", ps2SpawnCount );
+				ps2SpawnCount++;
+#endif
+				if( svgame.dllFuncs.pfnSpawn( ent ) == -1 )
 			{
 				// game rejected the spawn
 				if( !FBitSet( ent->v.flags, FL_KILLME ))
@@ -4932,10 +5041,17 @@ void SV_LoadFromFile( const char *mapname, char *entities )
 					inhibited++;
 				}
 			}
+#if XASH_PS2
+				if( ps2SpawnCount >= 61 && ps2SpawnCount <= 91 )
+					printf( "[XASH-PS2] STAGE=ENTITY_SPAWN_AFTER count=%d\n", ps2SpawnCount - 1 );
+#endif
 		}
 
 		Con_DPrintf( "\n%i entities inhibited\n", inhibited );
 	}
+#if XASH_PS2
+	printf( "[XASH-PS2] STAGE=ENTITY_SPAWN_DONE count=%d\n", ps2SpawnCount );
+#endif
 
 	// reset world origin and angles for some reason
 	VectorClear( svgame.edicts->v.origin );
@@ -5037,7 +5153,7 @@ qboolean SV_LoadProgs( const char *name )
 	static playermove_t		gpMove;
 	edict_t			*e;
 
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 	// still loaded from the previous game (SV_Shutdown keeps it, see
 	// there): the level was deactivated, edicts and strings are free
 	if( svgame.hInstance )

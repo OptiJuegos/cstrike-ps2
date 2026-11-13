@@ -18,7 +18,11 @@ GNU General Public License for more details.
 #include "server.h"
 #include "base_cmd.h"
 
+#if XASH_PS2
+#define MAX_CMD_BUFFER	16384	// largest cfg the PS2 runs is ~11 KB
+#else
 #define MAX_CMD_BUFFER	32768
+#endif
 #define MAX_CMD_LINE	2048
 #define MAX_ALIAS_NAME	32
 

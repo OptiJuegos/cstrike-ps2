@@ -14,8 +14,11 @@ GNU General Public License for more details.
 */
 
 #include "common.h"
-#if XASH_PSP
+#if XASH_PSP || XASH_PS2
 #include <malloc.h> // mallinfo
+#endif
+#if XASH_PS2
+#include "arena_ps2.h"
 #endif
 
 #define MEMHEADER_SENTINEL1	0xDEADF00D
@@ -27,7 +30,11 @@ GNU General Public License for more details.
 #define Q_free SWAP_Free
 #else
 #define Q_malloc malloc
+#if XASH_PS2
+#define Q_free PS2_Free
+#else
 #define Q_free free
+#endif
 #endif
 
 struct mempool_s;
@@ -45,7 +52,12 @@ typedef struct memheader_s
 	uint		sentinel1;	// should always be MEMHEADER_SENTINEL1
 
 	// immediately followed by data, which is followed by a MEMHEADER_SENTINEL2 byte
-} memheader_t;
+}
+#if XASH_PS2
+// 28 bytes left data only 4-aligned; a real EE faults on sd/ld (time_t, int64)
+__attribute__(( aligned( 16 )))
+#endif
+memheader_t;
 
 typedef struct mempool_s
 {
@@ -63,6 +75,35 @@ typedef struct mempool_s
 
 mempool_t *poolchain = NULL; // critical stuff
 
+#if XASH_PS2
+#define MEM_PS2_ARENA_MIN_TEMP ( 16 * 1024 )
+#define MEM_PS2_ARENA_MIN_ZONE ( 64 * 1024 ) // edicts and baselines, cvars are far below
+
+// model and map data live and die with the level, and so do the entity tables;
+// big file and image buffers are short-lived. Everything else stays out, so it
+// can't pin the arena.
+static qboolean Mem_PS2IsLevelBlock( const mempool_t *pool, size_t size )
+{
+	const char *name = pool->name;
+
+	if( !Q_strncmp( name, "^2models/", 9 ) || !Q_strncmp( name, "^2maps/", 7 ))
+		return true;
+
+	if( size >= MEM_PS2_ARENA_MIN_TEMP && ( !Q_strcmp( name, "FileSystem Pool" ) || !Q_strcmp( name, "ImageLib Pool" )
+		|| !Q_strcmp( name, "Client Edicts Zone" ) || !Q_strcmp( name, "Server Edicts Zone" )))
+		return true;
+
+	return size >= MEM_PS2_ARENA_MIN_ZONE && !Q_strcmp( name, "Zone Engine" );
+}
+
+static void *Mem_PS2AllocBlock( const mempool_t *pool, size_t size )
+{
+	void *block = Mem_PS2IsLevelBlock( pool, size ) ? PS2_Arena_Alloc( size ) : NULL;
+
+	return block ? block : malloc( size );
+}
+#endif
+
 void *_Mem_Alloc( byte *poolptr, size_t size, qboolean clear, const char *filename, int fileline )
 {
 	memheader_t	*mem;
@@ -70,16 +111,21 @@ void *_Mem_Alloc( byte *poolptr, size_t size, qboolean clear, const char *filena
 
 	if( size <= 0 ) return NULL;
 	if( poolptr == NULL ) Sys_Error( "Mem_Alloc: pool == NULL (alloc at %s:%i)\n", filename, fileline );
-	pool->totalsize += size;
-
 	// big allocations are not clumped
-	pool->realsize += sizeof( memheader_t ) + size + sizeof( int );
+#if XASH_PS2
+	mem = (memheader_t *)Mem_PS2AllocBlock( pool, sizeof( memheader_t ) + size + sizeof( int ));
+#else
 	mem = (memheader_t *)Q_malloc( sizeof( memheader_t ) + size + sizeof( int ));
+#endif
 	if( mem == NULL )
 	{
 		Mem_PrintOutOfMemory( pool, size );
 		Sys_Error( "Mem_Alloc: out of memory (alloc at %s:%i)\n", filename, fileline );
 	}
+	// Only account successful allocations: otherwise an OOM report wrongly
+	// counts the failed request as live memory (e.g. a 2.33 MB Studio MDL).
+	pool->totalsize += size;
+	pool->realsize += sizeof( memheader_t ) + size + sizeof( int );
 
 	mem->filename = filename;
 	mem->fileline = fileline;
@@ -157,6 +203,65 @@ void _Mem_Free( void *data, const char *filename, int fileline )
 	if( data == NULL ) Sys_Error( "Mem_Free: data == NULL (called at %s:%i)\n", filename, fileline );
 	Mem_FreeBlock((memheader_t *)((byte *)data - sizeof( memheader_t )), filename, fileline );
 }
+
+#if XASH_PS2
+/*
+ * Transfer an FS_LoadFile allocation into its Studio model pool while
+ * shrinking unused trailing texture bytes without a second large block.
+ * If realloc(shrink) fails, the original allocation is retained safely.
+ */
+void *_Mem_PS2RehomeShrink( byte *newpoolptr, void *memptr, size_t size, const char *filename, int fileline )
+{
+	memheader_t *mem, *resized;
+	mempool_t *oldpool, *newpool = (mempool_t *)newpoolptr;
+	size_t oldsize;
+
+	if( !memptr || !newpool ) Sys_Error( "Mem_PS2RehomeShrink: null pointer (%s:%d)\n", filename, fileline );
+	mem = (memheader_t *)((byte *)memptr - sizeof( memheader_t ));
+	oldpool = mem->pool;
+	oldsize = mem->size;
+	if( mem->sentinel1 != MEMHEADER_SENTINEL1 || !size || size > oldsize
+		|| *((byte *)mem + sizeof( memheader_t ) + oldsize ) != MEMHEADER_SENTINEL2 )
+		Sys_Error( "Mem_PS2RehomeShrink: bad block or length (%s:%d)\n", filename, fileline );
+
+	if( size < oldsize )
+	{
+		if( PS2_Arena_Contains( mem ))
+		{
+			PS2_Arena_Shrink( mem, sizeof( memheader_t ) + size + sizeof( int ));
+			resized = mem;
+		}
+		else resized = (memheader_t *)realloc( mem, sizeof( memheader_t ) + size + sizeof( int ));
+		if( resized )
+		{
+			mem = resized;
+			if( mem->prev ) mem->prev->next = mem;
+			else oldpool->chain = mem;
+			if( mem->next ) mem->next->prev = mem;
+			oldpool->totalsize -= oldsize - size;
+			oldpool->realsize -= oldsize - size;
+			mem->size = size;
+			*((byte *)mem + sizeof( memheader_t ) + size ) = MEMHEADER_SENTINEL2;
+		}
+	}
+	if( oldpool != newpool )
+	{
+		if( mem->prev ) mem->prev->next = mem->next;
+		else oldpool->chain = mem->next;
+		if( mem->next ) mem->next->prev = mem->prev;
+		oldpool->totalsize -= mem->size;
+		oldpool->realsize -= sizeof( memheader_t ) + mem->size + sizeof( int );
+		newpool->totalsize += mem->size;
+		newpool->realsize += sizeof( memheader_t ) + mem->size + sizeof( int );
+		mem->pool = newpool;
+		mem->prev = NULL;
+		mem->next = newpool->chain;
+		if( mem->next ) mem->next->prev = mem;
+		newpool->chain = mem;
+	}
+	return (byte *)mem + sizeof( memheader_t );
+}
+#endif
 
 void *_Mem_Realloc( byte *poolptr, void *memptr, size_t size, qboolean clear, const char *filename, int fileline )
 {
@@ -332,6 +437,102 @@ void Mem_PrintStats( void )
 	Con_Printf( "total allocated size: ^1%s\n", Q_memprint( realsize ));
 }
 
+#if XASH_PS2
+/*
+========================
+Mem_PS2PrintSources
+
+Group live allocations by their originating line: hundreds of small blocks can
+hide below the per-pool totals. All pools when "only" is NULL. Does not allocate.
+========================
+*/
+static void Mem_PS2PrintSources( const mempool_t *only )
+{
+	const char *sources[64] = { 0 };
+	uint lines[64] = { 0 };
+	size_t bytes[64] = { 0 };
+	uint counts[64] = { 0 };
+	const mempool_t *pool;
+	memheader_t *header;
+	int i, j, used = 0;
+
+	for( pool = only ? only : poolchain; pool; pool = only ? NULL : pool->next )
+	{
+		for( header = pool->chain; header; header = header->next )
+		{
+			for( i = 0; i < used; i++ )
+				if( sources[i] == header->filename && lines[i] == header->fileline ) break;
+			if( i == used )
+			{
+				if( used == 64 ) continue;
+				sources[used] = header->filename;
+				lines[used] = header->fileline;
+				used++;
+			}
+			bytes[i] += header->size;
+			counts[i]++;
+		}
+	}
+	for( j = 0; j < used; j++ )
+	{
+		int biggest = -1;
+		for( i = 0; i < used; i++ )
+			if( bytes[i] && ( biggest < 0 || bytes[i] > bytes[biggest] )) biggest = i;
+		if( biggest < 0 ) break;
+		printf( "[XASH-PS2] MEM_SOURCE bytes=%u count=%u source=%s:%u\n",
+			(unsigned)bytes[biggest], counts[biggest], sources[biggest], lines[biggest] );
+		bytes[biggest] = 0;
+	}
+}
+
+// blocks still allocated in a pool (FS_PS2ReleaseWads: lump buffers out)
+int Mem_PS2CountAllocs( byte *poolptr )
+{
+	const mempool_t *pool = (const mempool_t *)poolptr;
+	const memheader_t *header;
+	int count = 0;
+
+	if( pool )
+		for( header = pool->chain; header; header = header->next )
+			count++;
+	return count;
+}
+
+/*
+========================
+Mem_PS2PrintBreakdown
+
+Heap by pool and by source line, from the ps2_profile_present report.
+malloc in use minus MEM_POOLS_TOTAL is what bypasses pools (C++ game objects).
+========================
+*/
+void Mem_PS2PrintBreakdown( void )
+{
+	const mempool_t *pool;
+	const memheader_t *header;
+	size_t total = 0, small = 0;
+	uint allocs = 0, pools = 0;
+
+	for( pool = poolchain; pool; pool = pool->next )
+	{
+		uint count = 0;
+
+		for( header = pool->chain; header; header = header->next )
+			count++;
+		allocs += count;
+		pools++;
+		total += pool->realsize;
+		if( pool->realsize >= 64 * 1024 )
+			printf( "[XASH-PS2] MEM_POOL bytes=%u allocs=%u name=%s\n",
+				(unsigned)pool->realsize, count, pool->name );
+		else small += pool->realsize;
+	}
+	printf( "[XASH-PS2] MEM_POOLS_TOTAL bytes=%u pools=%u allocs=%u under_64k=%u\n",
+		(unsigned)total, pools, allocs, (unsigned)small );
+	Mem_PS2PrintSources( NULL );
+}
+#endif
+
 /*
 ========================
 Mem_PrintOutOfMemory
@@ -342,6 +543,49 @@ more, every model and sound has its own pool and the full list is huge.
 */
 static void Mem_PrintOutOfMemory( mempool_t *failed, size_t size )
 {
+#if XASH_PS2
+	// PCSX2 captures printf directly. The in-game console may not render
+	// Con_Printf during a failed map allocation, so report the real pools here.
+	{
+		mempool_t *pool;
+		size_t total = 0;
+		/* A pool total alone cannot identify large texture/model allocations.
+		 * Retain only the 12 largest live blocks on the stack; never allocate
+		 * more memory while reporting an out-of-memory condition. */
+		const memheader_t *largest[12] = { 0 };
+		const mempool_t *owners[12] = { 0 };
+		int i, j;
+		printf( "[XASH-PS2] STAGE=MEM_OOM_REQUEST bytes=%u pool=%s\n",
+			(unsigned)size, failed->name );
+		for( pool = poolchain; pool; pool = pool->next )
+		{
+			memheader_t *header;
+			total += pool->realsize;
+			if( pool->realsize >= 128 * 1024 )
+				printf( "[XASH-PS2] MEM_POOL bytes=%u name=%s\n",
+					(unsigned)pool->realsize, pool->name );
+			for( header = pool->chain; header; header = header->next )
+			{
+				for( i = 0; i < 12; i++ )
+					if( !largest[i] || header->size > largest[i]->size ) break;
+				if( i == 12 ) continue;
+				for( j = 11; j > i; j-- )
+				{
+					largest[j] = largest[j-1];
+					owners[j] = owners[j-1];
+				}
+				largest[i] = header;
+				owners[i] = pool;
+			}
+		}
+		printf( "[XASH-PS2] MEM_POOLS_TOTAL bytes=%u\n", (unsigned)total );
+		for( i = 0; i < 12 && largest[i]; i++ )
+			printf( "[XASH-PS2] MEM_TOP rank=%d bytes=%u pool=%s source=%s:%u\n",
+				i+1, (unsigned)largest[i]->size, owners[i]->name,
+				largest[i]->filename, largest[i]->fileline );
+		Mem_PS2PrintSources( failed );
+	}
+#endif
 	Con_Printf( "out of memory: wanted %s in pool %s\n", Q_memprint( size ), failed->name );
 	Mem_PrintReport();
 }
@@ -379,6 +623,16 @@ void Mem_PrintReport( void )
 		// textures (memalign when VRAM is full) and C++ game library objects
 		struct mallinfo mi = mallinfo();
 		Con_Printf( "malloc: in use %s, heap arena %s\n", Q_memprint( mi.uordblks ), Q_memprint( mi.arena ));
+	}
+	Cmd_ExecuteString( "texturelist" );
+#elif XASH_PS2
+	{
+		// the free total alone hides fragmentation: also find the largest block
+		struct mallinfo mi = mallinfo();
+
+		printf( "[XASH-PS2] MEM_HEAP in_use=%u arena=%u free_in_arena=%u largest_block=%u\n",
+			(unsigned)mi.uordblks, (unsigned)mi.arena, (unsigned)mi.fordblks, (unsigned)PS2_Heap_LargestBlock( 1024 ));
+		PS2_Arena_Report( "out_of_memory" );
 	}
 	Cmd_ExecuteString( "texturelist" );
 #endif
@@ -560,4 +814,7 @@ Memory_Init
 void Memory_Init( void )
 {
 	poolchain = NULL; // init mem chain
+#if XASH_PS2
+	PS2_Arena_Init();
+#endif
 }

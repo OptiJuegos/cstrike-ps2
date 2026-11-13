@@ -72,6 +72,82 @@ int R_CullModel( cl_entity_t *e, const vec3_t absmin, const vec3_t absmax )
 	if( R_CullBox( absmin, absmax ))
 		return 1;
 
+#if XASH_PS2
+	// Map decor has stable world-space bounds. Followers and render effects
+	// need their existing paths because their visible extent can differ.
+	qboolean decor = r_split_pvs->value >= 2.0f && !e->player && e->index > 0 && e->model
+		&& ( e->model->type == mod_studio || e->model->type == mod_sprite )
+		&& e->curstate.movetype == MOVETYPE_NONE && !e->curstate.aiment
+		&& e->curstate.renderfx == kRenderFxNone
+		&& ( e->curstate.rendermode == kRenderNormal
+			|| e->curstate.rendermode == kRenderTransTexture
+			|| e->curstate.rendermode == kRenderTransAlpha );
+	if( decor && e->model->type == mod_studio )
+	{
+		const studiohdr_t *header = e->model->cache.data;
+		// A parent must still update its attachments. During sequence blending,
+		// the previous pose may also extend beyond the supplied current bounds.
+		decor = header && !header->numattachments
+			&& ( !e->latched.sequencetime || e->latched.sequencetime + 0.2f <= gpGlobals->time );
+	}
+
+	// The server sends the union of both players' visibility. Use this
+	// camera's PVS before processing the model or sprite for that view.
+	if(( e->player || decor ) && r_split_pvs->value && RI.drawWorld && RP_NORMALPASS()
+		&& !RI.drawOrtho && !RI.drawCubemap
+		&& RI.viewleaf && RI.viewleaf->contents != CONTENTS_SOLID
+		&& WORLDMODEL && WORLDMODEL->visdata
+		&& !r_novis->value && !r_nocull->value && !r_lockpvs->value )
+	{
+		cvar_t *split = gEngfuncs.pfnGetCvarPointer( "_split_active", 0 );
+		vec3_t mins, maxs;
+		float margin = 0.0f;
+		int i;
+
+		// The engine changes this value directly, without updating its string.
+		if( !split || !split->value )
+			return 0;
+
+		// The merged weapon may extend beyond the player's sequence bounds.
+		// Include its radius and a minimum reach for the standard CS weapons.
+		if( e->player && e->curstate.weaponmodel )
+		{
+			model_t *weapon = gEngfuncs.pfnGetModelByIndex( e->curstate.weaponmodel );
+			margin = weapon ? Q_max( 64.0f, weapon->radius ) : 64.0f;
+		}
+		if( decor && e->model->type == mod_sprite )
+		{
+			const msprite_t *sprite = e->model->cache.data;
+			vec3_t half;
+			const float scale = e->curstate.scale != 0.0f ? fabsf( e->curstate.scale ) : 1.0f;
+			if( !sprite )
+				return 0;
+			VectorSubtract( absmax, absmin, half );
+			VectorScale( half, 0.5f, half );
+			const float radius = Q_max( VectorLength( half ), sprite->radius * scale ) + 0.01f;
+
+			// Sprites rotate toward each camera. Use a sphere that encloses
+			// their scaled bounds in every orientation for the PVS query.
+			for( i = 0; i < 3; i++ )
+			{
+				const float center = ( absmin[i] + absmax[i] ) * 0.5f;
+				mins[i] = center - radius;
+				maxs[i] = center + radius;
+			}
+		}
+		else
+		{
+			for( i = 0; i < 3; i++ )
+			{
+				mins[i] = absmin[i] - margin;
+				maxs[i] = absmax[i] + margin;
+			}
+		}
+		if( !gEngfuncs.Mod_BoxVisible( mins, maxs, RI.visbytes ))
+			return 1;
+	}
+#endif
+
 	return 0;
 }
 

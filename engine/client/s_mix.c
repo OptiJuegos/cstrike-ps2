@@ -27,7 +27,9 @@ GNU General Public License for more details.
 
 #define CCHANVOLUMES	2
 
-#if XASH_PSP
+#if XASH_PS2 && XASH_SOUND == SOUND_NULL
+#define SND_SCALE_BITS	1	// never filled or read without dma.initialized
+#elif XASH_PSP || XASH_PS2
 #define SND_SCALE_BITS	6	// 64 volume steps for 8 bit sounds (Quake had 32), the table is 64 KB smaller
 #else
 #define SND_SCALE_BITS	7
@@ -43,7 +45,8 @@ portable_samplepair_t	facingbuffer[(PAINTBUFFER_SIZE+1)];
 portable_samplepair_t	temppaintbuffer[(PAINTBUFFER_SIZE+1)];
 paintbuffer_t		paintbuffers[CPAINTBUFFERS];
 
-int			snd_scaletable[SND_SCALE_LEVELS][256];
+// |entry| <= 128 * (SND_SCALE_LEVELS - 1) << SND_SCALE_SHIFT < 32768: short halves the table
+short			snd_scaletable[SND_SCALE_LEVELS][256];
 
 void S_InitScaletable( void )
 {
@@ -220,7 +223,7 @@ CHANNEL MIXING
 */
 void S_PaintMonoFrom8( portable_samplepair_t *pbuf, int *volume, byte *pData, int outCount )
 {
-	int	*lscale, *rscale;
+	short	*lscale, *rscale;
 	int 	i, data;
 		
 	lscale = snd_scaletable[volume[0] >> SND_SCALE_SHIFT];
@@ -236,7 +239,7 @@ void S_PaintMonoFrom8( portable_samplepair_t *pbuf, int *volume, byte *pData, in
 
 void S_PaintStereoFrom8( portable_samplepair_t *pbuf, int *volume, byte *pData, int outCount )
 {
-	int	*lscale, *rscale;
+	short	*lscale, *rscale;
 	uint	left, right;
 	word	*data;
 	int	i;
@@ -298,7 +301,7 @@ void S_Mix8Mono( portable_samplepair_t *pbuf, int *volume, byte *pData, int inpu
 {
 	int	i, sampleIndex = 0;
 	uint	sampleFrac = inputOffset;
-	int	*lscale, *rscale;
+	short	*lscale, *rscale;
 
 	if( timecompress != 0 )
 	{
@@ -330,7 +333,7 @@ void S_Mix8Stereo( portable_samplepair_t *pbuf, int *volume, byte *pData, int in
 {
 	int	i, sampleIndex = 0;
 	uint	sampleFrac = inputOffset;
-	int	*lscale, *rscale;
+	short	*lscale, *rscale;
 
 	// Not using pitch shift?
 	if( rateScale == FIX( 1 ))

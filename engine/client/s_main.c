@@ -31,6 +31,15 @@ rawchan_t		*raw_channels[MAX_RAW_CHANNELS];
 qboolean		snd_ambient = false;
 qboolean		snd_fade_sequence = false;
 listener_t	s_listener;
+
+// splitscreen: player 2's ears; each ear of a channel takes the louder listener
+static struct
+{
+	qboolean	active;
+	vec3_t	origin;
+	vec3_t	right;
+	int	entnum;
+} s_listener2;
 int		total_channels;
 int		soundtime;	// sample PAIRS
 int   		paintedtime; 	// sample PAIRS
@@ -39,6 +48,7 @@ convar_t		*s_volume;
 convar_t		*s_musicvolume;
 convar_t		*s_show;
 convar_t		*s_mixahead;
+static convar_t	*s_extraupdate;
 convar_t		*s_lerping;
 convar_t		*s_ambient_level;
 convar_t		*s_ambient_fade;
@@ -46,6 +56,8 @@ convar_t		*s_combine_sounds;
 convar_t		*snd_mute_losefocus;
 convar_t		*s_test;		// cvar for testing new effects
 convar_t		*s_samplecount;
+convar_t		*s_skipsounds;
+convar_t		*s_cachekb;
 
 /*
 =============================================================================
@@ -467,6 +479,25 @@ void SND_Spatialize( channel_t *ch )
 
 	// fill out channel volumes for single location
 	S_SpatializeChannel( &ch->leftvol, &ch->rightvol, ch->master_vol, gain, dot, dist * ch->dist_mult );
+
+	if( s_listener2.active )
+	{
+		int	left, right;
+
+		if( ch->entnum == s_listener2.entnum )
+		{
+			left = right = ch->master_vol;
+		}
+		else
+		{
+			VectorSubtract( ch->origin, s_listener2.origin, source_vec );
+			dist = VectorNormalizeLength( source_vec );
+			dot = ( ch->dist_mult <= 0.0f ) ? 0.0f : DotProduct( s_listener2.right, source_vec );
+			S_SpatializeChannel( &left, &right, ch->master_vol, gain, dot, dist * ch->dist_mult );
+		}
+		ch->leftvol = Q_max( ch->leftvol, left );
+		ch->rightvol = Q_max( ch->rightvol, right );
+	}
 
 	// if playing a word, set volume
 	VOX_SetChanVol( ch );
@@ -1493,7 +1524,7 @@ Don't let sound skip if going slow
 */
 void S_ExtraUpdate( void )
 {
-	if( !dma.initialized ) return;
+	if( !dma.initialized || !s_extraupdate->value ) return;
 	S_UpdateChannels ();
 }
 
@@ -1512,6 +1543,24 @@ void S_UpdateFrame( struct ref_viewpass_s *rvp )
 	VectorCopy( rvp->vieworigin, s_listener.origin );
 	AngleVectors( rvp->viewangles, s_listener.forward, s_listener.right, s_listener.up );
 	s_listener.entnum = rvp->viewentity; // can be camera entity too
+}
+
+/*
+=================
+S_UpdateSplitListener
+
+Player 2's view in splitscreen, or NULL when there is none
+=================
+*/
+void S_UpdateSplitListener( const struct ref_viewpass_s *rvp )
+{
+	s_listener2.active = rvp != NULL;
+	if( !rvp )
+		return;
+
+	VectorCopy( rvp->vieworigin, s_listener2.origin );
+	AngleVectors( rvp->viewangles, NULL, s_listener2.right, NULL );
+	s_listener2.entnum = rvp->viewentity;
 }
 
 /*
@@ -1818,6 +1867,7 @@ qboolean S_Init( void )
 	s_volume = Cvar_Get( "volume", "0.7", FCVAR_ARCHIVE, "sound volume" );
 	s_musicvolume = Cvar_Get( "MP3Volume", "1.0", FCVAR_ARCHIVE, "background music volume" );
 	s_mixahead = Cvar_Get( "_snd_mixahead", "0.12", 0, "how much sound to mix ahead of time" );
+	s_extraupdate = Cvar_Get( "s_extraupdate", "1", FCVAR_ARCHIVE, "mix again in the middle of a frame; 0 is enough when _snd_mixahead covers the slowest frame" );
 	s_show = Cvar_Get( "s_show", "0", FCVAR_ARCHIVE, "show playing sounds" );
 	s_lerping = Cvar_Get( "s_lerping", "0", FCVAR_ARCHIVE, "apply interpolation to sound output" );
 	s_ambient_level = Cvar_Get( "ambient_level", "0.3", FCVAR_ARCHIVE, "volume of environment noises (water and wind)" );
@@ -1826,6 +1876,8 @@ qboolean S_Init( void )
 	snd_mute_losefocus = Cvar_Get( "snd_mute_losefocus", "1", FCVAR_ARCHIVE, "silence the audio when game window loses focus" );
 	s_test = Cvar_Get( "s_test", "0", 0, "engine developer cvar for quick testing new features" );
 	s_samplecount = Cvar_Get( "s_samplecount", "0", FCVAR_ARCHIVE, "sample count (0 for default value)" );
+	s_skipsounds = Cvar_Get( "s_skipsounds", "", 0, "space separated sound name prefixes that never load (saves RAM)" );
+	s_cachekb = Cvar_Get( "s_cachekb", "0", 0, "sound cache limit in KB; least recently played idle sounds are freed above it (0 = no limit)" );
 
 	Cmd_AddCommand( "play", S_Play_f, "playing a specified sound file" );
 	Cmd_AddCommand( "play2", S_Play2_f, "playing a group of specified sound files" ); // nehahra stuff

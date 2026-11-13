@@ -202,8 +202,11 @@ qboolean CL_FireEvent( event_info_t *ei, int slot )
 		{
 			if( ev->func )
 			{
+				qboolean split = CL_SplitEventBegin( ei->args.entindex );
+
 				CL_DescribeEvent( slot, ei->flags, cl.event_precache[ei->index] );
 				ev->func( &ei->args );
+				if( split ) CL_SplitEventEnd();
 				return true;
 			}
 
